@@ -11,12 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
+from c7n.resources.elasticache import _cluster_eligible_for_snapshot
 
-from .common import BaseTest, TestConfig as Config
+from .common import BaseTest
 
 
 class TestElastiCacheCluster(BaseTest):
+
+    def test_eligibility_snapshot(self):
+        # so black box testing, due to use of private interface.
+
+        self.assertTrue(
+            _cluster_eligible_for_snapshot(
+                {'Engine': 'redis', 'CacheNodeType': 'cache.t2.medium'}))
+        self.assertFalse(
+            _cluster_eligible_for_snapshot(
+                {'Engine': 'redis', 'CacheNodeType': 'cache.t1.medium'}))
+        self.assertFalse(
+            _cluster_eligible_for_snapshot(
+                {'Engine': 'memcached', 'CacheNodeType': 'cache.t2.medium'}))
 
     def test_elasticache_security_group(self):
         session_factory = self.replay_flight_data("test_elasticache_security_group")
@@ -103,7 +116,7 @@ class TestElastiCacheCluster(BaseTest):
                     }
                 ],
             },
-            config=Config.empty(region="us-east-2"),
+            config=dict(region="us-east-2"),
             session_factory=factory,
         )
         resources = p.run()
@@ -135,7 +148,7 @@ class TestElastiCacheCluster(BaseTest):
                 "resource": "cache-snapshot",
                 "actions": [{"type": "copy-cluster-tags", "tags": ["tagkey"]}],
             },
-            Config.empty(region="us-east-1"),
+            config=dict(region="us-east-1"),
             session_factory=session_factory,
         )
 
@@ -443,3 +456,15 @@ class TestModifyVpcSecurityGroupsAction(BaseTest):
         self.assertEqual(len(resources[0]["SecurityGroups"]), 1)
         self.assertEqual(len(clean_resources[0]["SecurityGroups"]), 2)
         self.assertEqual(len(clean_resources), 3)
+
+
+class TestElastiCacheReplicationGroup(BaseTest):
+
+    def test_elasticache_replication_group(self):
+        session_factory = self.replay_flight_data("test_elasticache_replication_group")
+        p = self.load_policy(
+            {"name": "elasticache-rg", "resource": "elasticache-group"},
+            session_factory=session_factory,)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['ReplicationGroupId'], 'test-c7n-rg')

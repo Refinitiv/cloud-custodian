@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+try:
+    from botocore.config import Config
+except ImportError:
+    from c7n.config import Bag as Config  # pragma: no cover
+
 from .core import EventAction
 from c7n import utils
 from c7n.manager import resources
@@ -18,7 +24,7 @@ from c7n.version import version as VERSION
 
 
 class LambdaInvoke(EventAction):
-    """ Invoke an arbitrary lambda
+    """Invoke an arbitrary lambda
 
     serialized invocation parameters
 
@@ -37,31 +43,35 @@ class LambdaInvoke(EventAction):
 
      - type: invoke-lambda
        function: my-function
+
+    Note if your synchronously invoking the lambda, you may also need
+    to configure the timeout, to avoid multiple invokes. The default
+    is 90s, if the lambda doesn't respond within that time the boto
+    sdk will invoke the lambda again with the same
+    arguments. Alternatively use async: true
+
     """
     schema_alias = True
     schema = {
         'type': 'object',
         'required': ['type', 'function'],
+        'additionalProperties': False,
         'properties': {
             'type': {'enum': ['invoke-lambda']},
             'function': {'type': 'string'},
+            'region': {'type': 'string'},
             'async': {'type': 'boolean'},
             'qualifier': {'type': 'string'},
-            'batch_size': {'type': 'integer'}
+            'batch_size': {'type': 'integer'},
+            'timeout': {'type': 'integer'},
+            'vars': {'type': 'object'},
         }
     }
 
-    def get_permissions(self):
-        if self.data.get('async', True):
-            return ('lambda:InvokeAsync',)
-        return ('lambda:Invoke',)
-
-    permissions = ('lambda:InvokeFunction',)
+    permissions = ('lambda:InvokeFunction',
+               'iam:ListAccountAliases',)
 
     def process(self, resources, event=None):
-        client = utils.local_session(
-            self.manager.session_factory).client('lambda')
-
         params = dict(FunctionName=self.data['function'])
         if self.data.get('qualifier'):
             params['Qualifier'] = self.data['Qualifier']
@@ -69,9 +79,19 @@ class LambdaInvoke(EventAction):
         if self.data.get('async', True):
             params['InvocationType'] = 'Event'
 
+        config = Config(read_timeout=self.data.get(
+            'timeout', 90), region_name=self.data.get('region', None))
+        client = utils.local_session(
+            self.manager.session_factory).client('lambda', config=config)
+        alias = utils.get_account_alias_from_sts(
+            utils.local_session(self.manager.session_factory))
+
         payload = {
             'version': VERSION,
             'event': event,
+            'account_id': self.manager.config.account_id,
+            'account': alias,
+            'region': self.manager.config.region,
             'action': self.data,
             'policy': self.manager.data}
 
@@ -86,11 +106,10 @@ class LambdaInvoke(EventAction):
             results.append(result)
         return results
 
+    @classmethod
+    def register_resources(klass, registry, resource_class):
+        if 'invoke-lambda' not in resource_class.action_registry:
+            resource_class.action_registry.register('invoke-lambda', LambdaInvoke)
 
-def register_action_invoke_lambda(registry, _):
-    for resource in registry.keys():
-        klass = registry.get(resource)
-        klass.action_registry.register('invoke-lambda', LambdaInvoke)
 
-
-resources.subscribe(resources.EVENT_FINAL, register_action_invoke_lambda)
+resources.subscribe(LambdaInvoke.register_resources)

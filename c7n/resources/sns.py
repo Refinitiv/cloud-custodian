@@ -11,34 +11,49 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import json
 
 from c7n.actions import RemovePolicyBase, ModifyPolicyBase, BaseAction
 from c7n.filters import CrossAccountAccessFilter, PolicyChecker
 from c7n.filters.kms import KmsRelatedFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.resolver import ValuesFrom
 from c7n.utils import local_session, type_schema
+from c7n.tags import RemoveTag, Tag, TagDelayedAction, TagActionFilter
+
+from c7n.resources.securityhub import PostFinding
+
+
+class DescribeTopic(DescribeSource):
+
+    def augment(self, resources):
+        client = local_session(self.manager.session_factory).client('sns')
+
+        def _augment(r):
+            tags = self.manager.retry(client.list_tags_for_resource,
+                ResourceArn=r['TopicArn'])['Tags']
+            r['Tags'] = tags
+            return r
+
+        resources = super().augment(resources)
+        with self.manager.executor_factory(max_workers=3) as w:
+            return list(w.map(_augment, resources))
 
 
 @resources.register('sns')
 class SNS(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sns'
-        type = 'topic'
+        arn_type = 'topic'
         enum_spec = ('list_topics', 'Topics', None)
         detail_spec = (
             'get_topic_attributes', 'TopicArn', 'TopicArn', 'Attributes')
         id = 'TopicArn'
-        filter_name = None
-        filter_type = None
         name = 'DisplayName'
-        date = None
         dimension = 'TopicName'
+        cfn_type = 'AWS::SNS::Topic'
         default_report_fields = (
             'TopicArn',
             'DisplayName',
@@ -46,6 +61,109 @@ class SNS(QueryResourceManager):
             'SubscriptionsPending',
             'SubscriptionsDeleted'
         )
+
+    permissions = ('sns:ListTagsForResource',)
+    source_mapping = {
+        'describe': DescribeTopic,
+        'config': ConfigSource
+    }
+
+
+SNS.filter_registry.register('marked-for-op', TagActionFilter)
+
+
+@SNS.action_registry.register('post-finding')
+class SNSPostFinding(PostFinding):
+
+    resource_type = 'AwsSnsTopic'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(
+            self.filter_empty({
+                'KmsMasterKeyId': r.get('KmsMasterKeyId'),
+                'Owner': r['Owner'],
+                'TopicName': r['TopicArn'].rsplit(':', 1)[-1]}))
+        return envelope
+
+
+@SNS.action_registry.register('tag')
+class TagTopic(Tag):
+    """Action to create tag(s) on sns
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: tag-sns
+                resource: sns
+                filters:
+                  - "tag:target-tag": absent
+                actions:
+                  - type: tag
+                    key: target-tag
+                    value: target-tag-value
+    """
+
+    permissions = ('sns:TagResource',)
+
+    def process_resource_set(self, client, resources, new_tags):
+        for r in resources:
+            try:
+                client.tag_resource(
+                    ResourceArn=r['TopicArn'],
+                    Tags=new_tags)
+            except client.exceptions.ResourceNotFound:
+                continue
+
+
+@SNS.action_registry.register('remove-tag')
+class UntagTopic(RemoveTag):
+    """Action to remove tag(s) on sns
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: sns-remove-tag
+                resource: sns
+                filters:
+                  - "tag:OutdatedTag": present
+                actions:
+                  - type: remove-tag
+                    tags: ["OutdatedTag"]
+    """
+
+    permissions = ('sns:UntagResource',)
+
+    def process_resource_set(self, client, resources, tags):
+        for r in resources:
+            try:
+                client.untag_resource(ResourceArn=r['TopicArn'], TagKeys=tags)
+            except client.exceptions.ResourceNotFound:
+                continue
+
+
+@SNS.action_registry.register('mark-for-op')
+class MarkTopicForOp(TagDelayedAction):
+    """Mark SNS for deferred action
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: sns-invalid-tag-mark
+            resource: sns
+            filters:
+              - "tag:InvalidTag": present
+            actions:
+              - type: mark-for-op
+                op: delete
+                days: 1
+    """
 
 
 class SNSPolicyChecker(PolicyChecker):
@@ -159,7 +277,7 @@ class RemovePolicyStatement(RemovePolicyBase):
     .. code-block:: yaml
 
            policies:
-              - name: sns-cross-account
+              - name: remove-sns-cross-account
                 resource: sns
                 filters:
                   - type: cross-account
@@ -205,22 +323,6 @@ class RemovePolicyStatement(RemovePolicyBase):
 
 @SNS.action_registry.register('modify-policy')
 class ModifyPolicyStatement(ModifyPolicyBase):
-    """Action to modify policy statements from SNS
-
-    :example:
-
-    .. code-block:: yaml
-
-           policies:
-              - name: sns-cross-account
-                resource: sns
-                filters:
-                  - type: cross-account
-                actions:
-                  - type: modify-policy
-                    add-statements: [statement]
-                    remove-statements: [statement_id] or * or 'matched'
-    """
 
     permissions = ('sns:SetTopicAttributes', 'sns:GetTopicAttributes')
 
@@ -256,6 +358,22 @@ class ModifyPolicyStatement(ModifyPolicyBase):
 
 @SNS.filter_registry.register('kms-key')
 class KmsFilter(KmsRelatedFilter):
+    """
+    Filters SNS topic by kms key and optionally the aliasname
+    of the kms key by using 'c7n:AliasName'
+
+    :example:
+
+        .. code-block:: yaml
+
+            policies:
+                - name: sns-encrypt-key-check
+                  resource: sns
+                  filters:
+                    - type: kms-key
+                      key: c7n:AliasName
+                      value: alias/aws/sns
+    """
 
     RelatedIdsExpression = 'KmsMasterKeyId'
 
@@ -279,21 +397,21 @@ class SetEncryption(BaseAction):
               actions:
                 - type: set-encryption
                   key: alias/cmk/key
-                  enabled: True
+                  enabled: true
 
             - name: set-sns-topic-encryption-with-id
               resource: sns
               actions:
                 - type: set-encryption
                   key: abcdefgh-1234-1234-1234-123456789012
-                  enabled: True
+                  enabled: true
 
             - name: set-sns-topic-encryption-with-arn
               resource: sns
               actions:
                 - type: set-encryption
                   key: arn:aws:kms:us-west-1:123456789012:key/abcdefgh-1234-1234-1234-123456789012
-                  enabled: True
+                  enabled: true
     """
 
     schema = type_schema(
@@ -319,3 +437,91 @@ class SetEncryption(BaseAction):
                 AttributeValue=key
             )
         return resources
+
+
+@SNS.action_registry.register('delete')
+class DeleteTopic(BaseAction):
+    """
+    Deletes a SNS Topic
+
+    :example:
+
+    .. code-block:: yaml
+
+      policies:
+        - name: delete-bad-topic
+          resource: aws.sns
+          filters:
+            - TopicArn: arn:aws:sns:us-east-2:123456789012:BadTopic
+          actions:
+            - type: delete
+    """
+
+    schema = type_schema('delete')
+
+    permissions = ('sns:DeleteTopic',)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('sns')
+        for r in resources:
+            try:
+                client.delete_topic(TopicArn=r['TopicArn'])
+            except client.exceptions.NotFoundException:
+                continue
+
+
+@resources.register('sns-subscription')
+class SNSSubscription(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'sns'
+        enum_spec = ('list_subscriptions', 'Subscriptions', None)
+        id = name = dimension = 'SubscriptionArn'
+        arn = 'SubscriptionArn'
+        cfn_type = 'AWS::SNS::Subscription'
+        default_report_fields = (
+            'SubscriptionArn',
+            'Owner',
+            'Protocol',
+            'Endpoint',
+            'TopicArn'
+        )
+
+
+@SNSSubscription.action_registry.register('delete')
+class SubscriptionDeleteAction(BaseAction):
+    """
+    Action to delete a subscription
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: external-owner-delete
+            resource: sns-subscription
+            filters:
+              - type: value
+                key: "Owner"
+                value: "{account_id}"
+                op: ne
+            actions:
+              - type: delete
+    """
+
+    schema = type_schema('delete')
+    permissions = ("sns:Unsubscribe",)
+
+    def process(self, subscriptions):
+        client = local_session(
+            self.manager.session_factory).client(self.manager.get_model().service)
+
+        for s in subscriptions:
+            self.process_subscription(client, s)
+
+    def process_subscription(self, client, subscription):
+        # Can't delete a pending subscription
+        if subscription['SubscriptionArn'] != 'PendingConfirmation':
+            self.manager.retry(
+                client.unsubscribe, SubscriptionArn=subscription['SubscriptionArn'],
+                ignore_err_codes=('NotFoundException',))

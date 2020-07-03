@@ -11,13 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import jmespath
-import six
 
 
-class CloudWatchEvents(object):
+class CloudWatchEvents:
     """A mapping of events to resource types."""
 
     # **These are just shortcuts**, you can use the policy definition to
@@ -79,6 +76,11 @@ class CloudWatchEvents(object):
             'ids': 'requestParameters.tableName',
             'source': 'dynamodb.amazonaws.com'},
 
+        'CreateFunction': {
+            'event': 'CreateFunction20150331',
+            'source': 'lambda.amazonaws.com',
+            'ids': 'requestParameters.functionName'},
+
         'RunInstances': {
             'ids': 'responseElements.instancesSet.items[].instanceId',
             'source': 'ec2.amazonaws.com'}}
@@ -104,7 +106,7 @@ class CloudWatchEvents(object):
         # but usage context is lambda entry.
         if k in cls.trail_events:
             v = dict(cls.trail_events[k])
-            if isinstance(v['ids'], six.string_types):
+            if isinstance(v['ids'], str):
                 v['ids'] = e = jmespath.compile('detail.%s' % v['ids'])
                 cls.trail_events[k]['ids'] = e
             return v
@@ -132,8 +134,11 @@ class CloudWatchEvents(object):
             id_query = e.get('ids')
             if not id_query:
                 raise ValueError("No id query configured")
-            resource_ids = jmespath.search(
-                id_query, event.get('detail', {}))
+            evt = event
+            # be forgiving for users specifying with details or without
+            if not id_query.startswith('detail.'):
+                evt = event.get('detail', {})
+            resource_ids = jmespath.search(id_query, evt)
             if resource_ids:
                 break
         return resource_ids

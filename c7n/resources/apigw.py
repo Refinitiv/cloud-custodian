@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+import functools
 from botocore.exceptions import ClientError
 
 from concurrent.futures import as_completed
@@ -22,23 +21,37 @@ from c7n.filters import FilterRegistry, ValueFilter
 from c7n.filters.iamaccess import CrossAccountAccessFilter
 from c7n.manager import resources, ResourceManager
 from c7n import query, utils
-from c7n.tags import universal_augment
+from c7n.utils import generate_arn, type_schema
+
+
+ANNOTATION_KEY_MATCHED_METHODS = 'c7n:matched-resource-methods'
+ANNOTATION_KEY_MATCHED_INTEGRATIONS = 'c7n:matched-method-integrations'
 
 
 @resources.register('rest-account')
 class RestAccount(ResourceManager):
+    # note this is not using a regular resource manager or type info
+    # its a pseudo resource, like an aws account
 
     filter_registry = FilterRegistry('rest-account.filters')
     action_registry = ActionRegistry('rest-account.actions')
 
-    class resource_type(object):
+    class resource_type(query.TypeInfo):
         service = 'apigateway'
         name = id = 'account_id'
-        dimensions = None
+        dimension = None
+        arn = False
 
     @classmethod
     def get_permissions(cls):
+        # this resource is not query manager based as its a pseudo
+        # resource. in that it always exists, it represents the
+        # service's account settings.
         return ('apigateway:GET',)
+
+    @classmethod
+    def has_arn(self):
+        return False
 
     def get_model(self):
         return self.resource_type
@@ -107,29 +120,63 @@ class UpdateAccount(BaseAction):
         client.update_account(patchOperations=self.data['patch'])
 
 
-@resources.register('rest-api')
-class RestAPI(query.QueryResourceManager):
+class ApiDescribeSource(query.DescribeSource):
 
-    class resource_type(object):
+    def augment(self, resources):
+        for r in resources:
+            tags = r.setdefault('Tags', [])
+            for k, v in r.pop('tags', {}).items():
+                tags.append({
+                    'Key': k,
+                    'Value': v})
+        return resources
+
+
+@resources.register('rest-api')
+class RestApi(query.QueryResourceManager):
+
+    class resource_type(query.TypeInfo):
         service = 'apigateway'
-        type = 'restapis'
+        arn_type = '/restapis'
         enum_spec = ('get_rest_apis', 'items', None)
         id = 'id'
-        filter_name = None
         name = 'name'
         date = 'createdDate'
         dimension = 'GatewayName'
+        cfn_type = config_type = "AWS::ApiGateway::RestApi"
+        universal_taggable = object()
+        permissions_enum = ('apigateway:GET',)
+
+    source_mapping = {
+        'config': query.ConfigSource,
+        'describe': ApiDescribeSource
+    }
+
+    @property
+    def generate_arn(self):
+        """
+         Sample arn: arn:aws:apigateway:us-east-1::/restapis/rest-api-id
+         This method overrides c7n.utils.generate_arn and drops
+         account id from the generic arn.
+        """
+        if self._generate_arn is None:
+            self._generate_arn = functools.partial(
+                generate_arn,
+                self.resource_type.service,
+                region=self.config.region,
+                resource_type=self.resource_type.arn_type)
+        return self._generate_arn
 
 
-@RestAPI.filter_registry.register('cross-account')
+@RestApi.filter_registry.register('cross-account')
 class RestApiCrossAccount(CrossAccountAccessFilter):
 
     policy_attribute = 'policy'
     permissions = ('apigateway:GET',)
 
 
-@RestAPI.action_registry.register('update')
-class UpdateAPI(BaseAction):
+@RestApi.action_registry.register('update')
+class UpdateApi(BaseAction):
     """Update configuration of a REST API.
 
     Non-exhaustive list of updateable attributes.
@@ -143,6 +190,7 @@ class UpdateAPI(BaseAction):
 
        policies:
          - name: apigw-description
+           resource: rest-api
            filters:
              - description: empty
            actions:
@@ -167,24 +215,35 @@ class UpdateAPI(BaseAction):
                 patchOperations=self.data['patch'])
 
 
-@resources.register('rest-stage')
-class RestStage(query.ChildResourceManager):
+@RestApi.action_registry.register('delete')
+class DeleteApi(BaseAction):
+    """Delete a REST API.
 
-    child_source = 'describe-rest-stage'
+    :example:
 
-    class resource_type(object):
-        service = 'apigateway'
-        parent_spec = ('rest-api', 'restApiId', None)
-        enum_spec = ('get_stages', 'item', None)
-        name = id = 'stageName'
-        date = 'createdDate'
-        dimension = None
-        universal_taggable = True
-        type = None
+    contrived example to delete rest api
 
-    def augment(self, resources):
-        return universal_augment(
-            self, super(RestStage, self).augment(resources))
+    .. code-block:: yaml
+
+       policies:
+         - name: apigw-delete
+           resource: rest-api
+           filters:
+             - description: empty
+           actions:
+             - type: delete
+    """
+    permissions = ('apigateway:DELETE',)
+    schema = type_schema('delete')
+
+    def process(self, resources):
+        client = utils.local_session(
+            self.manager.session_factory).client('apigateway')
+        for r in resources:
+            try:
+                client.delete_rest_api(restApiId=r['id'])
+            except client.exceptions.NotFoundException:
+                continue
 
 
 @query.sources.register('describe-rest-stage')
@@ -207,6 +266,42 @@ class DescribeRestStage(query.ChildDescribeSource):
                     'Value': v})
             results.append(r)
         return results
+
+
+@resources.register('rest-stage')
+class RestStage(query.ChildResourceManager):
+
+    class resource_type(query.TypeInfo):
+        service = 'apigateway'
+        parent_spec = ('rest-api', 'restApiId', None)
+        enum_spec = ('get_stages', 'item', None)
+        name = id = 'stageName'
+        date = 'createdDate'
+        universal_taggable = True
+        cfn_type = config_type = "AWS::ApiGateway::Stage"
+        arn_type = 'stages'
+        permissions_enum = ('apigateway:GET',)
+
+    child_source = 'describe-rest-stage'
+    source_mapping = {
+        'describe-rest-stage': DescribeRestStage,
+        'config': query.ConfigSource
+    }
+
+    @property
+    def generate_arn(self):
+        self._generate_arn = functools.partial(
+            generate_arn,
+            self.resource_type.service,
+            region=self.config.region)
+        return self._generate_arn
+
+    def get_arns(self, resources):
+        arns = []
+        for r in resources:
+            arns.append(self.generate_arn('/restapis/' + r['restApiId'] +
+             '/stages/' + r[self.get_model().id]))
+        return arns
 
 
 @RestStage.action_registry.register('update')
@@ -253,7 +348,7 @@ class DeleteStage(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: delete-rest-stage
@@ -263,7 +358,7 @@ class DeleteStage(BaseAction):
             actions:
               - type: delete
     """
-    permissions = ('apigateway:Delete',)
+    permissions = ('apigateway:DELETE',)
     schema = utils.type_schema('delete')
 
     def process(self, resources):
@@ -283,13 +378,14 @@ class RestResource(query.ChildResourceManager):
 
     child_source = 'describe-rest-resource'
 
-    class resource_type(object):
+    class resource_type(query.TypeInfo):
         service = 'apigateway'
         parent_spec = ('rest-api', 'restApiId', None)
         enum_spec = ('get_resources', 'items', None)
         id = 'id'
         name = 'path'
-        dimension = None
+        permissions_enum = ('apigateway:GET',)
+        cfn_type = 'AWS::ApiGateway::Resource'
 
 
 @query.sources.register('describe-rest-resource')
@@ -309,7 +405,193 @@ class DescribeRestResource(query.ChildDescribeSource):
         return results
 
 
-ANNOTATION_KEY = 'c7n-matched-resource-methods'
+@resources.register('rest-vpclink')
+class RestApiVpcLink(query.QueryResourceManager):
+
+    class resource_type(query.TypeInfo):
+        service = 'apigateway'
+        enum_spec = ('get_vpc_links', 'items', None)
+        id = 'id'
+        name = 'name'
+        permissions_enum = ('apigateway:GET',)
+        cfn_type = 'AWS::ApiGateway::VpcLink'
+
+
+@RestResource.filter_registry.register('rest-integration')
+class FilterRestIntegration(ValueFilter):
+    """Filter rest resources based on a key value for the rest method integration of the api
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: api-method-integrations-with-type-aws
+            resource: rest-resource
+            filters:
+              - type: rest-integration
+                key: type
+                value: AWS
+    """
+
+    schema = utils.type_schema(
+        'rest-integration',
+        method={'type': 'string', 'enum': [
+            'all', 'ANY', 'PUT', 'GET', "POST",
+            "DELETE", "OPTIONS", "HEAD", "PATCH"]},
+        rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ('apigateway:GET',)
+
+    def process(self, resources, event=None):
+        method_set = self.data.get('method', 'all')
+        # 10 req/s with burst to 40
+        client = utils.local_session(
+            self.manager.session_factory).client('apigateway')
+
+        # uniqueness constraint validity across apis?
+        resource_map = {r['id']: r for r in resources}
+
+        futures = {}
+        results = set()
+
+        with self.executor_factory(max_workers=2) as w:
+            tasks = []
+            for r in resources:
+                r_method_set = method_set
+                if method_set == 'all':
+                    r_method_set = r.get('resourceMethods', {}).keys()
+                for m in r_method_set:
+                    tasks.append((r, m))
+            for task_set in utils.chunks(tasks, 20):
+                futures[w.submit(
+                    self.process_task_set, client, task_set)] = task_set
+
+            for f in as_completed(futures):
+                task_set = futures[f]
+
+                if f.exception():
+                    self.manager.log.warning(
+                        "Error retrieving integrations on resources %s",
+                        ["%s:%s" % (r['restApiId'], r['path'])
+                         for r, mt in task_set])
+                    continue
+
+                for i in f.result():
+                    if self.match(i):
+                        results.add(i['resourceId'])
+                        resource_map[i['resourceId']].setdefault(
+                            ANNOTATION_KEY_MATCHED_INTEGRATIONS, []).append(i)
+
+        return [resource_map[rid] for rid in results]
+
+    def process_task_set(self, client, task_set):
+        results = []
+        for r, m in task_set:
+            try:
+                integration = client.get_integration(
+                    restApiId=r['restApiId'],
+                    resourceId=r['id'],
+                    httpMethod=m)
+                integration.pop('ResponseMetadata', None)
+                integration['restApiId'] = r['restApiId']
+                integration['resourceId'] = r['id']
+                integration['resourceHttpMethod'] = m
+                results.append(integration)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NotFoundException':
+                    pass
+
+        return results
+
+
+@RestResource.action_registry.register('update-integration')
+class UpdateRestIntegration(BaseAction):
+    """Change or remove api integration properties based on key value
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: enforce-timeout-on-api-integration
+            resource: rest-resource
+            filters:
+              - type: rest-integration
+                key: timeoutInMillis
+                value: 29000
+            actions:
+              - type: update-integration
+                patch:
+                  - op: replace
+                    path: /timeoutInMillis
+                    value: "3000"
+    """
+
+    schema = utils.type_schema(
+        'update-integration',
+        patch={'type': 'array', 'items': OP_SCHEMA},
+        required=['patch'])
+    permissions = ('apigateway:PATCH',)
+
+    def validate(self):
+        found = False
+        for f in self.manager.iter_filters():
+            if isinstance(f, FilterRestIntegration):
+                found = True
+                break
+        if not found:
+            raise ValueError(
+                ("update-integration action requires ",
+                 "rest-integration filter usage in policy"))
+        return self
+
+    def process(self, resources):
+        client = utils.local_session(
+            self.manager.session_factory).client('apigateway')
+        ops = self.data['patch']
+        for r in resources:
+            for i in r.get(ANNOTATION_KEY_MATCHED_INTEGRATIONS, []):
+                client.update_integration(
+                    restApiId=i['restApiId'],
+                    resourceId=i['resourceId'],
+                    httpMethod=i['resourceHttpMethod'],
+                    patchOperations=ops)
+
+
+@RestResource.action_registry.register('delete-integration')
+class DeleteRestIntegration(BaseAction):
+    """Delete an api integration. Useful if the integration type is a security risk.
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: enforce-no-resource-integration-with-type-aws
+            resource: rest-resource
+            filters:
+              - type: rest-integration
+                key: type
+                value: AWS
+            actions:
+              - type: delete-integration
+    """
+    permissions = ('apigateway:DELETE',)
+    schema = utils.type_schema('delete-integration')
+
+    def process(self, resources):
+        client = utils.local_session(self.manager.session_factory).client('apigateway')
+
+        for r in resources:
+            for i in r.get(ANNOTATION_KEY_MATCHED_INTEGRATIONS, []):
+                try:
+                    client.delete_integration(
+                        restApiId=i['restApiId'],
+                        resourceId=i['resourceId'],
+                        httpMethod=i['resourceHttpMethod'])
+                except client.exceptions.NotFoundException:
+                    continue
 
 
 @RestResource.filter_registry.register('rest-method')
@@ -335,6 +617,7 @@ class FilterRestMethod(ValueFilter):
             'all', 'ANY', 'PUT', 'GET', "POST",
             "DELETE", "OPTIONS", "HEAD", "PATCH"]},
         rinherit=ValueFilter.schema)
+    schema_alias = False
     permissions = ('apigateway:GET',)
 
     def process(self, resources, event=None):
@@ -373,7 +656,7 @@ class FilterRestMethod(ValueFilter):
                     if self.match(m):
                         results.add(m['resourceId'])
                         resource_map[m['resourceId']].setdefault(
-                            ANNOTATION_KEY, []).append(m)
+                            ANNOTATION_KEY_MATCHED_METHODS, []).append(m)
         return [resource_map[rid] for rid in results]
 
     def process_task_set(self, client, task_set):
@@ -396,7 +679,7 @@ class UpdateRestMethod(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: enforce-iam-permissions-on-api
@@ -437,7 +720,7 @@ class UpdateRestMethod(BaseAction):
             self.manager.session_factory).client('apigateway')
         ops = self.data['patch']
         for r in resources:
-            for m in r.get(ANNOTATION_KEY, []):
+            for m in r.get(ANNOTATION_KEY_MATCHED_METHODS, []):
                 client.update_method(
                     restApiId=m['restApiId'],
                     resourceId=m['resourceId'],

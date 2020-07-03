@@ -1,10 +1,1 @@
-FROM python:2.7
-
-ADD . /src
-WORKDIR /src
-RUN pip install -r requirements.txt
-RUN python setup.py develop
-
-VOLUME ["/var/log/cloud-custodian", "/etc/cloud-custodian"]
-
-ENTRYPOINT ["/usr/local/bin/custodian"]
+docker/cli

@@ -11,22 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-from datetime import datetime, timedelta, tzinfo
 import fnmatch
+from io import StringIO
 import json
-import unittest
 import os
 import shutil
 import zipfile
+import re
+from datetime import datetime, timedelta, tzinfo
+from distutils.util import strtobool
 
 import boto3
-from botocore.response import StreamingBody
-import jmespath
-from placebo import pill
 import placebo
-from six import StringIO
+from botocore.response import StreamingBody
+from placebo import pill
+
+from c7n.testing import CustodianTestCore
+
+# Custodian Test Account. This is used only for testing.
+# Access is available for community project maintainers.
+ACCOUNT_ID = "644160558196"
 
 ###########################################################################
 # BEGIN PLACEBO MONKEY PATCH
@@ -106,6 +110,7 @@ def serialize(obj):
     raise TypeError("Type not serializable")
 
 
+pill.FakeHttpResponse.raw = None
 placebo.pill.serialize = serialize
 placebo.pill.deserialize = deserialize
 
@@ -120,21 +125,19 @@ class BluePill(pill.Pill):
         self._avail = self.get_available()
 
     def get_available(self):
-        return set(
-            [
-                os.path.join(self.data_path, n)
-                for n in fnmatch.filter(os.listdir(self.data_path), "*.json")
-            ]
-        )
+        return {
+            os.path.join(self.data_path, n)
+            for n in fnmatch.filter(os.listdir(self.data_path), "*.json")
+        }
 
     def get_next_file_path(self, service, operation):
-        fn = super(BluePill, self).get_next_file_path(service, operation)
+        fn, format = super(BluePill, self).get_next_file_path(service, operation)
         # couple of double use cases
         if fn in self._avail:
             self._avail.remove(fn)
         else:
             print("\ndouble use %s\n" % fn)
-        return fn
+        return (fn, format)
 
     def stop(self):
         result = super(BluePill, self).stop()
@@ -160,7 +163,7 @@ class ZippedPill(pill.Pill):
         self.archive = zipfile.ZipFile(self.path, "a", zipfile.ZIP_DEFLATED)
         self._files = set()
 
-        files = set([n for n in self.archive.namelist() if n.startswith(self.prefix)])
+        files = {n for n in self.archive.namelist() if n.startswith(self.prefix)}
 
         if not files:
             return super(ZippedPill, self).record()
@@ -234,6 +237,7 @@ class ZippedPill(pill.Pill):
         while next_file is None:
             index = self._index.setdefault(base_name, 1)
             fn = os.path.join(self._data_path, base_name + "_{0}.json".format(index))
+            fn = fn.replace('\\', '/')
             if fn in self._files:
                 next_file = fn
                 self._index[base_name] += 1
@@ -252,7 +256,29 @@ def attach(session, data_path, prefix=None, debug=False):
     return pill
 
 
-class PillTest(unittest.TestCase):
+class RedPill(pill.Pill):
+
+    def datetime_converter(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+
+    def save_response(self, service, operation, response_data,
+                    http_response=200):
+        """
+        Override to sanitize response metadata and account_ids
+        """
+        if 'ResponseMetadata' in response_data:
+            response_data['ResponseMetadata'] = {}
+
+        response_data = json.dumps(response_data, default=serialize)
+        response_data = re.sub(r"\d{12}", ACCOUNT_ID, response_data)  # noqa
+        response_data = json.loads(response_data, object_hook=deserialize)
+
+        super(RedPill, self).save_response(service, operation, response_data,
+                    http_response)
+
+
+class PillTest(CustodianTestCore):
 
     archive_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "placebo_data.zip"
@@ -268,10 +294,6 @@ class PillTest(unittest.TestCase):
 
     recording = False
 
-    def assertJmes(self, expr, instance, expected):
-        value = jmespath.search(expr, instance)
-        self.assertEqual(value, expected)
-
     def cleanUp(self):
         self.pill = None
 
@@ -286,7 +308,8 @@ class PillTest(unittest.TestCase):
         session = boto3.Session()
         default_region = session.region_name
         if not zdata:
-            pill = placebo.attach(session, test_dir)
+            pill = RedPill()
+            pill.attach(session, test_dir)
         else:
             pill = attach(session, self.archive_path, test_case, debug=True)
 
@@ -295,17 +318,37 @@ class PillTest(unittest.TestCase):
         self.addCleanup(pill.stop)
         self.addCleanup(self.cleanUp)
 
-        def factory(region=None, assume=None):
-            if region and region != default_region:
-                new_session = boto3.Session(region_name=region)
-                assert not zdata
-                new_pill = placebo.attach(new_session, test_dir, debug=True)
-                new_pill.record()
-                self.addCleanup(new_pill.stop)
-                return new_session
-            return session
+        class FakeFactory:
 
-        return factory
+            def __call__(fake, region=None, assume=None):
+                new_session = None
+                # slightly experimental for test recording, using
+                # cross account assumes, note this will record sts
+                # assume role api calls creds into test data, they will
+                # go stale, but its best to modify before commiting.
+                # Disabled by default.
+                if 0 and (assume is not False and fake.assume_role):
+                    client = session.client('sts')
+                    creds = client.assume_role(
+                        RoleArn=fake.assume_role,
+                        RoleSessionName='CustodianTest')['Credentials']
+                    new_session = boto3.Session(
+                        aws_access_key_id=creds['AccessKeyId'],
+                        aws_secret_access_key=creds['SecretAccessKey'],
+                        aws_session_token=creds['SessionToken'],
+                        region_name=region or fake.region or default_region)
+                elif region and region != default_region:
+                    new_session = boto3.Session(region_name=region)
+
+                if new_session:
+                    assert not zdata
+                    new_pill = placebo.attach(new_session, test_dir, debug=True)
+                    new_pill.record()
+                    self.addCleanup(new_pill.stop)
+                    return new_session
+                return session
+
+        return FakeFactory()
 
     def replay_flight_data(self, test_case, zdata=False, region=None):
         """
@@ -313,7 +356,7 @@ class PillTest(unittest.TestCase):
         default region. It is unused when replaying stored data.
         """
 
-        if os.environ.get("C7N_FUNCTIONAL") == "yes":
+        if strtobool(os.environ.get('C7N_FUNCTIONAL', 'no')):
             self.recording = True
             return lambda region=region, assume=None: boto3.Session(region_name=region)
 

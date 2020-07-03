@@ -7,10 +7,11 @@ This a plugin to Cloud Custodian that adds Azure support.
 
 The Azure provider must be installed as a separate package in addition to c7n. 
 
+    $ git clone https://github.com/cloud-custodian/cloud-custodian.git
     $ virtualenv custodian
     $ source custodian/bin/activate
-    (custodian) $ pip install c7n
-    (custodian) $ pip install c7n_azure
+    (custodian) $ pip install -e cloud-custodian/.
+    (custodian) $ pip install -e cloud-custodian/tools/c7n_azure/.
 
 
 ## Write your first policy
@@ -38,7 +39,7 @@ Create a file named ``custodian.yml`` with this content:
 ## Run your policy
 
 First, choose one of the supported authentication mechanisms and either log in to Azure CLI or set
-environment variables as documented in [Authentication](http://capitalone.github.io/cloud-custodian/docs/azure/authentication.html#azure-authentication).
+environment variables as documented in [Authentication](https://cloudcustodian.io/docs/azure/authentication.html#azure-authentication).
 
     custodian run --output-dir=. custodian.yml
 
@@ -55,9 +56,9 @@ files (subsequent runs will append to the log by default rather than
 overwriting it). 
 
 ## Links
-- [Getting Started](http://capitalone.github.io/cloud-custodian/docs/azure/gettingstarted.html)
-- [Example Scenarios](http://capitalone.github.io/cloud-custodian/docs/azure/examples/index.html)
-- [Example Policies](http://capitalone.github.io/cloud-custodian/docs/azure/policy/index.html)
+- [Getting Started](https://cloudcustodian.io/docs/azure/gettingstarted.html)
+- [Example Scenarios](https://cloudcustodian.io/docs/azure/examples/index.html)
+- [Example Policies](https://cloudcustodian.io/docs/azure/policy/index.html)
 
 
 

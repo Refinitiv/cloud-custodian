@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from .common import BaseTest
 import datetime
 from dateutil import tz as tzutil
+from unittest.mock import MagicMock
 
 from c7n.resources.dynamodb import DeleteTable
 from c7n.executor import MainThreadExecutor
@@ -31,7 +30,7 @@ class DynamodbTest(BaseTest):
         )
         resources = p.run()
         self.assertEqual(len(resources), 1)
-        self.assertEqual(resources[0]["TableName"], "rolltop")
+        self.assertEqual(resources[0]["TableName"], "test-table-kms-filter")
         self.assertEqual(resources[0]["TableStatus"], "ACTIVE")
 
     def test_invoke_action(self):
@@ -72,13 +71,131 @@ class DynamodbTest(BaseTest):
                 "filters": [{"tag:test_key": "test_value"}],
             },
             session_factory=session_factory,
-        )
+            config={'region': 'us-west-2', 'account_id': '644160558196'})
+
         resources = p.run()
         self.assertEqual(len(resources), 1)
         arn = resources[0]["TableArn"]
         tags = client.list_tags_of_resource(ResourceArn=arn)
         tag_map = {t["Key"]: t["Value"] for t in tags["Tags"]}
         self.assertTrue("test_key" in tag_map)
+
+    def test_kms_key_filter(self):
+        session_factory = self.replay_flight_data("test_dynamodb_kms_key_filter")
+        p = self.load_policy(
+            {
+                "name": "dynamodb-kms-key-filters",
+                "resource": "dynamodb-table",
+                "filters": [
+                    {
+                        "type": "kms-key",
+                        "key": "c7n:AliasName",
+                        "value": "^(alias/aws/dynamodb)",
+                        "op": "regex"
+                    }
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["TableName"], "test-table-kms-filter")
+
+    def test_continuous_backup_filter(self):
+        session_factory = self.replay_flight_data("test_dynamodb_continuous_backup_filter")
+        p = self.load_policy(
+            {
+                "name": "dynamodb-continuous_backup-filters",
+                "resource": "dynamodb-table",
+                "filters": [
+                    {
+                        "type": "continuous-backup",
+                        "key": "PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                        "value": "ENABLED",
+                        "op": "ne"
+                    }
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(
+            resources[0]["c7n:continuous-backup"]["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"], # noqa
+            "DISABLED")
+
+    def test_continuous_backup_action(self):
+        session_factory = self.replay_flight_data("test_dynamodb_continuous_backup_action")
+        client = session_factory().client("dynamodb")
+        p = self.load_policy(
+            {
+                "name": "dynamodb-continuous_backup-action",
+                "resource": "dynamodb-table",
+                "filters": [
+                    {
+                        "type": "continuous-backup",
+                        "key": "PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                        "value": "ENABLED",
+                        "op": "ne"
+                    }
+                ],
+                "actions": [
+                    {
+                        "type": "set-continuous-backup"
+                    }
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(
+            resources[0]["c7n:continuous-backup"]["PointInTimeRecoveryDescription"]["PointInTimeRecoveryStatus"],  # noqa
+            "DISABLED")
+        res = client.describe_continuous_backups(TableName=resources[0]["TableName"])['ContinuousBackupsDescription']  # noqa
+        self.assertEqual(
+            res['PointInTimeRecoveryDescription']["PointInTimeRecoveryStatus"],
+            'ENABLED')
+
+    def test_continuous_backup_action_error(self):
+        factory = self.replay_flight_data("test_dynamodb_continuous_backup_action")
+
+        client = factory().client("dynamodb")
+        mock_factory = MagicMock()
+        mock_factory.region = 'us-east-1'
+        mock_factory().client(
+            'dynamodb').exceptions.TableNotFoundException = (
+                client.exceptions.TableNotFoundException)
+
+        mock_factory().client('dynamodb').update_continuous_backups.side_effect = (
+            client.exceptions.TableNotFoundException(
+                {'Error': {'Code': 'xyz'}},
+                operation_name='update_continuous_backups'))
+        p = self.load_policy(
+            {
+                "name": "dynamodb-continuous_backup-action",
+                "resource": "dynamodb-table",
+                "filters": [
+                    {
+                        "type": "continuous-backup",
+                        "key": "PointInTimeRecoveryDescription.PointInTimeRecoveryStatus",
+                        "value": "ENABLED",
+                        "op": "ne"
+                    }
+                ],
+                "actions": [
+                    {
+                        "type": "set-continuous-backup"
+                    }
+                ]
+            },
+            session_factory=mock_factory,
+        )
+        try:
+            p.resource_manager.actions[0].process([{'TableName': 'abc', 'TableStatus': 'ACTIVE'}])
+        except client.exceptions.TableNotFoundException:
+            self.fail('should not raise')
+        mock_factory().client('dynamodb').update_continuous_backups.assert_called_once()
 
     def test_dynamodb_mark(self):
         session_factory = self.replay_flight_data("test_dynamodb_mark")
@@ -94,7 +211,7 @@ class DynamodbTest(BaseTest):
                 "actions": [
                     {
                         "type": "mark-for-op",
-                        "days": 0,
+                        "days": 1,
                         "op": "delete",
                         "tag": "test_tag",
                     }
@@ -423,3 +540,14 @@ class DynamoDbAccelerator(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertEqual(resources[0]['ClusterName'], 'c7n-test')
+
+    def test_dax_get_resource(self):
+        session_factory = self.replay_flight_data('test_dax_get_resource')
+
+        p = self.load_policy({
+            'name': 'dax-cluster-gr', 'resource': 'dax'},
+            session_factory=session_factory)
+        resources = p.resource_manager.get_resources(
+            ["c7n-test-cluster"])
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['TotalNodes'], 1)

@@ -11,30 +11,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import base64
+from datetime import datetime, timedelta
+import functools
 import json
 import os
-from datetime import datetime, timedelta
+import time
+import yaml
 
 import jinja2
+import jmespath
 from botocore.exceptions import ClientError
 from dateutil import parser
 from dateutil.tz import gettz, tzutc
-from ruamel import yaml
+
+
+class Providers:
+    AWS = 0
+    Azure = 1
 
 
 def get_jinja_env(template_folders):
     env = jinja2.Environment(trim_blocks=True, autoescape=False)
-    env.filters['yaml_safe'] = yaml.safe_dump
+    env.filters['yaml_safe'] = functools.partial(yaml.safe_dump, default_flow_style=False)
     env.filters['date_time_format'] = date_time_format
     env.filters['get_date_time_delta'] = get_date_time_delta
+    env.filters['from_json'] = json.loads
     env.filters['get_date_age'] = get_date_age
     env.globals['format_resource'] = resource_format
     env.globals['format_struct'] = format_struct
     env.globals['resource_tag'] = get_resource_tag_value
     env.globals['get_resource_tag_value'] = get_resource_tag_value
+    env.globals['search'] = jmespath.search
     env.loader = jinja2.FileSystemLoader(template_folders)
     return env
 
@@ -51,6 +59,17 @@ def get_rendered_jinja(
     except Exception as error_msg:
         logger.error("Invalid template reference %s\n%s" % (mail_template, error_msg))
         return
+
+    # recast seconds since epoch as utc iso datestring, template
+    # authors can use date_time_format helper func to convert local
+    # tz. if no execution start time was passed use current time.
+    execution_start = datetime.utcfromtimestamp(
+        sqs_message.get(
+            'execution_start',
+            time.mktime(
+                datetime.utcnow().timetuple())
+        )).isoformat()
+
     rendered_jinja = template.render(
         recipient=target,
         resources=resources,
@@ -59,6 +78,7 @@ def get_rendered_jinja(
         event=sqs_message.get('event', None),
         action=sqs_message['action'],
         policy=sqs_message['policy'],
+        execution_start=execution_start,
         region=sqs_message.get('region', ''))
     return rendered_jinja
 
@@ -69,7 +89,10 @@ def get_rendered_jinja(
 def get_resource_tag_targets(resource, target_tag_keys):
     if 'Tags' not in resource:
         return []
-    tags = {tag['Key']: tag['Value'] for tag in resource['Tags']}
+    if isinstance(resource['Tags'], dict):
+        tags = resource['Tags']
+    else:
+        tags = {tag['Key']: tag['Value'] for tag in resource['Tags']}
     targets = []
     for target_tag_key in target_tag_keys:
         if target_tag_key in tags:
@@ -84,6 +107,9 @@ def get_message_subject(sqs_message):
     subject = jinja_template.render(
         account=sqs_message.get('account', ''),
         account_id=sqs_message.get('account_id', ''),
+        event=sqs_message.get('event', None),
+        action=sqs_message['action'],
+        policy=sqs_message['policy'],
         region=sqs_message.get('region', '')
     )
     return subject
@@ -93,7 +119,7 @@ def setup_defaults(config):
     config.setdefault('region', 'us-east-1')
     config.setdefault('ses_region', config.get('region'))
     config.setdefault('memory', 1024)
-    config.setdefault('runtime', 'python2.7')
+    config.setdefault('runtime', 'python3.7')
     config.setdefault('timeout', 300)
     config.setdefault('subnets', None)
     config.setdefault('security_groups', None)
@@ -102,6 +128,7 @@ def setup_defaults(config):
     config.setdefault('ldap_bind_dn', None)
     config.setdefault('ldap_bind_user', None)
     config.setdefault('ldap_bind_password', None)
+    config.setdefault('endpoint_url', None)
     config.setdefault('datadog_api_key', None)
     config.setdefault('slack_token', None)
     config.setdefault('slack_webhook', None)
@@ -130,7 +157,15 @@ def get_resource_tag_value(resource, k):
     return ''
 
 
+def strip_prefix(value, prefix):
+    if value.startswith(prefix):
+        return value[len(prefix):]
+    return value
+
+
 def resource_format(resource, resource_type):
+    if resource_type.startswith('aws.'):
+        resource_type = strip_prefix(resource_type, 'aws.')
     if resource_type == 'ec2':
         tag_map = {t['Key']: t['Value'] for t in resource.get('Tags', ())}
         return "%s %s %s %s %s %s" % (
@@ -246,9 +281,8 @@ def resource_format(resource, resource_type):
             resource['account_id'],
             resource['account_name'])
     elif resource_type == 'cloudtrail':
-        return " %s %s" % (
-            resource['account_id'],
-            resource['account_name'])
+        return "%s" % (
+            resource['Name'])
     elif resource_type == 'vpc':
         return "%s " % (
             resource['VpcId'])
@@ -284,8 +318,50 @@ def resource_format(resource, resource_type):
         return "QueueURL: %s QueueArn: %s " % (
             resource['QueueUrl'],
             resource['QueueArn'])
+    elif resource_type == "efs":
+        return "name: %s  id: %s  state: %s" % (
+            resource['Name'],
+            resource['FileSystemId'],
+            resource['LifeCycleState']
+        )
+    elif resource_type == "network-addr":
+        return "ip: %s  id: %s  scope: %s" % (
+            resource['PublicIp'],
+            resource['AllocationId'],
+            resource['Domain']
+        )
+    elif resource_type == "route-table":
+        return "id: %s  vpc: %s" % (
+            resource['RouteTableId'],
+            resource['VpcId']
+        )
+    elif resource_type == "app-elb":
+        return "arn: %s  zones: %s  scheme: %s" % (
+            resource['LoadBalancerArn'],
+            len(resource['AvailabilityZones']),
+            resource['Scheme'])
+    elif resource_type == "nat-gateway":
+        return "id: %s  state: %s  vpc: %s" % (
+            resource['NatGatewayId'],
+            resource['State'],
+            resource['VpcId'])
+    elif resource_type == "internet-gateway":
+        return "id: %s  attachments: %s" % (
+            resource['InternetGatewayId'],
+            len(resource['Attachments']))
+    elif resource_type == 'lambda':
+        return "Name: %s  RunTime: %s  \n" % (
+            resource['FunctionName'],
+            resource['Runtime'])
     else:
         return "%s" % format_struct(resource)
+
+
+def get_provider(mailer_config):
+    if mailer_config.get('queue_url', '').startswith('asq://'):
+        return Providers.Azure
+
+    return Providers.AWS
 
 
 def kms_decrypt(config, logger, session, encrypted_field):
@@ -294,7 +370,7 @@ def kms_decrypt(config, logger, session, encrypted_field):
             kms = session.client('kms')
             return kms.decrypt(
                 CiphertextBlob=base64.b64decode(config[encrypted_field]))[
-                    'Plaintext']
+                    'Plaintext'].decode('utf8')
         except (TypeError, base64.binascii.Error) as e:
             logger.warning(
                 "Error: %s Unable to base64 decode %s, will assume plaintext." %
@@ -309,3 +385,52 @@ def kms_decrypt(config, logger, session, encrypted_field):
     else:
         logger.debug("No encrypted value to decrypt.")
         return None
+
+
+def decrypt(config, logger, session, encrypted_field):
+    if config.get(encrypted_field):
+        provider = get_provider(config)
+        if provider == Providers.Azure:
+            from c7n_mailer.azure_mailer.utils import azure_decrypt
+            return azure_decrypt(config, logger, session, encrypted_field)
+        elif provider == Providers.AWS:
+            return kms_decrypt(config, logger, session, encrypted_field)
+        else:
+            raise Exception("Unknown provider")
+    else:
+        logger.debug("No encrypted value to decrypt.")
+        return None
+
+
+# https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-user-identity.html
+def get_aws_username_from_event(logger, event):
+    if event is None:
+        return None
+    identity = event.get('detail', {}).get('userIdentity', {})
+    if not identity:
+        logger.warning("Could not get recipient from event \n %s" % (
+            format_struct(event)))
+        return None
+    if identity['type'] == 'AssumedRole':
+        logger.debug(
+            'In some cases there is no ldap uid is associated with AssumedRole: %s',
+            identity['arn'])
+        logger.debug(
+            'We will try to assume that identity is in the AssumedRoleSessionName')
+        user = identity['arn'].rsplit('/', 1)[-1]
+        if user is None or user.startswith('i-') or user.startswith('awslambda'):
+            return None
+        if ':' in user:
+            user = user.split(':', 1)[-1]
+        return user
+    if identity['type'] == 'IAMUser' or identity['type'] == 'WebIdentityUser':
+        return identity['userName']
+    if identity['type'] == 'Root':
+        return None
+    # this conditional is left here as a last resort, it should
+    # be better documented with an example UserIdentity json
+    if ':' in identity['principalId']:
+        user_id = identity['principalId'].split(':', 1)[-1]
+    else:
+        user_id = identity['principalId']
+    return user_id

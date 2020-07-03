@@ -21,16 +21,16 @@ from kubernetes.client import Configuration, ApiClient
 log = logging.getLogger('custodian.k8s.client')
 
 
-class Session(object):
+class Session:
     def __init__(self, config_file=None):
         self.config_file = config_file
-        self.http_proxy = os.getenv('HTTP_PROXY')
+        self.http_proxy = os.getenv('HTTPS_PROXY')
 
     def client(self, group, version):
         client_config = Configuration()
         config.load_kube_config(self.config_file, client_configuration=client_config)
         client_config.proxy = self.http_proxy
         api_client = ApiClient(configuration=client_config)
-        log.info('connecting to %s' % (api_client.configuration.host))
+        log.debug('connecting to %s' % (api_client.configuration.host))
         # e.g. client.CoreV1Api()
         return getattr(client, '%s%sApi' % (group, version))(api_client)

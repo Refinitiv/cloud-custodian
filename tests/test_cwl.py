@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from .common import BaseTest, functional
+from unittest.mock import MagicMock
 
 
 class LogGroupTest(BaseTest):
@@ -31,6 +30,22 @@ class LogGroupTest(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 1)
         self.assertEqual(resources[0]["c7n:CrossAccountViolations"], ["1111111111111"])
+
+    def test_age_normalize(self):
+        factory = self.replay_flight_data("test_log_group_age_normalize")
+        p = self.load_policy({
+            'name': 'log-age',
+            'resource': 'aws.log-group',
+            'filters': [{
+                'type': 'value',
+                'value_type': 'age',
+                'value': 30,
+                'op': 'greater-than',
+                'key': 'creationTime'}]},
+            session_factory=factory, config={'region': 'us-west-2'})
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['creationTime'], 1548368507.441)
 
     def test_last_write(self):
         factory = self.replay_flight_data("test_log_group_last_write")
@@ -73,6 +88,31 @@ class LogGroupTest(BaseTest):
             ],
             14,
         )
+
+    def test_log_group_delete_error(self):
+        factory = self.replay_flight_data("test_log_group_delete")
+        client = factory().client("logs")
+        mock_factory = MagicMock()
+        mock_factory.region = 'us-east-1'
+        mock_factory().client(
+            'logs').exceptions.ResourceNotFoundException = (
+                client.exceptions.ResourceNotFoundException)
+        mock_factory().client('logs').delete_log_group.side_effect = (
+            client.exceptions.ResourceNotFoundException(
+                {'Error': {'Code': 'xyz'}},
+                operation_name='delete_log_group'))
+        p = self.load_policy({
+            'name': 'delete-log-err',
+            'resource': 'log-group',
+            'actions': ['delete']},
+            session_factory=mock_factory)
+
+        try:
+            p.resource_manager.actions[0].process(
+                [{'logGroupName': 'abc'}])
+        except client.exceptions.ResourceNotFoundException:
+            self.fail('should not raise')
+        mock_factory().client('logs').delete_log_group.assert_called_once()
 
     @functional
     def test_delete(self):

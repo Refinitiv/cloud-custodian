@@ -14,10 +14,9 @@
 """
 Actions to take on resources
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import logging
 
+from c7n.element import Element
 from c7n.exceptions import PolicyValidationError, ClientError
 from c7n.executor import ThreadPoolExecutor
 from c7n.registry import PluginRegistry
@@ -28,8 +27,8 @@ class ActionRegistry(PluginRegistry):
     def __init__(self, *args, **kw):
         super(ActionRegistry, self).__init__(*args, **kw)
         # Defer to provider initialization of registry
-        from .notify import Notify
-        self.register('notify', Notify)
+        from .webhook import Webhook
+        self.register('webhook', Webhook)
 
     def parse(self, data, manager):
         results = []
@@ -56,7 +55,7 @@ class ActionRegistry(PluginRegistry):
         return action_class(data, manager)
 
 
-class Action(object):
+class Action(Element):
 
     permissions = ()
     metrics = ()

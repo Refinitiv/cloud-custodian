@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from c7n.executor import MainThreadExecutor
-from c7n.resources.rdscluster import RDSCluster
+from c7n.resources.rdscluster import RDSCluster, _run_cluster_method
 
 from .common import BaseTest
 
@@ -25,7 +23,7 @@ class RDSClusterTest(BaseTest):
         # This exists because we added tag augmentation after eight other tests
         # were created and I did not want to re-create the state to re-record
         # them with the extra API call. If those get re-recorded we can remove
-        # this.
+        # this. -scotwk
         self.patch(RDSCluster, "augment", lambda x, y: y)
 
     def test_rdscluster_security_group(self):
@@ -158,6 +156,29 @@ class RDSClusterTest(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 1)
 
+    def test_modify_rds_cluster(self):
+        session_factory = self.replay_flight_data("test_modify_rds_cluster")
+        p = self.load_policy(
+            {
+                "name": "modify-db-cluster",
+                "resource": "rds-cluster",
+                "filters": [{"DeletionProtection": True}],
+                "actions": [{
+                    "type": "modify-db-cluster",
+                    "attributes": {
+                        "DeletionProtection": False}
+                }]
+            },
+            session_factory=session_factory, config={'account_id': '644160558196'}
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        client = session_factory().client("rds")
+        cluster = client.describe_db_clusters(
+            DBClusterIdentifier='mytest')
+        self.assertFalse(cluster['DBClusters'][0]['DeletionProtection'])
+
     def test_rdscluster_tag_augment(self):
         session_factory = self.replay_flight_data("test_rdscluster_tag_augment")
         p = self.load_policy(
@@ -285,8 +306,94 @@ class RDSClusterTest(BaseTest):
         tag_map = {t["Key"]: t["Value"] for t in tags["TagList"]}
         self.assertFalse("custodian_next" in tag_map)
 
+    def test_run_cluster_method(self):
+
+        output = self.capture_logging('custodian.rds-cluster')
+
+        def foobar(DBClusterIdentifier):
+            raise ValueError("eek")
+
+        # unspecified
+        self.assertRaises(
+            ValueError, _run_cluster_method, foobar, {'DBClusterIdentifier': 'mytest'})
+
+        # ignored
+        try:
+            _run_cluster_method(foobar, {'DBClusterIdentifier': 'mytest'}, ValueError)
+        except ValueError:
+            self.fail("Shouldn't raise")
+        finally:
+            self.assertEqual(output.getvalue(), "")
+
+        # warn
+        try:
+            _run_cluster_method(
+                foobar, {'DBClusterIdentifier': 'mytest'}, warn=(ValueError, KeyError))
+        except ValueError:
+            self.fail("Shouldn't raise")
+        finally:
+            self.assertTrue("eek" in output.getvalue())
+
+    def test_stop(self):
+        factory = self.replay_flight_data("test_rdscluster_stop")
+        p = self.load_policy(
+            {"name": "rdscluster",
+             "resource": "rds-cluster",
+             "filters": [{'DBClusterIdentifier': 'mytest'}],
+             'actions': ['stop']},
+            session_factory=factory, config={'account_id': '644160558196'})
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['Status'], 'available')
+
+        client = factory().client('rds')
+        cluster = client.describe_db_clusters(
+            DBClusterIdentifier='mytest').get('DBClusters')[0]
+        self.assertEqual(cluster['Status'], 'stopping')
+
+    def test_start(self):
+        factory = self.replay_flight_data("test_rdscluster_start")
+        p = self.load_policy(
+            {"name": "rdscluster",
+             "resource": "rds-cluster",
+             "filters": [{'DBClusterIdentifier': 'mytest'}],
+             'actions': ['start']},
+            session_factory=factory, config={'account_id': '644160558196'})
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['Status'], 'stopped')
+
+        client = factory().client('rds')
+        cluster = client.describe_db_clusters(
+            DBClusterIdentifier='mytest').get('DBClusters')[0]
+        self.assertEqual(cluster['Status'], 'starting')
+
 
 class RDSClusterSnapshotTest(BaseTest):
+
+    def test_rdscluster_snapshot_config(self):
+        session_factory = self.replay_flight_data("test_rdscluster_snapshot_config")
+        p = self.load_policy(
+            {"name": "rdscluster-snapshot-simple",
+             "source": "config",
+             "resource": "rds-cluster-snapshot"},
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 2)
+        p2 = self.load_policy(
+            {"name": "rdscluster-snapshot-descr",
+             "resource": "rds-cluster-snapshot"},
+            session_factory=session_factory)
+        rm = p2.resource_manager
+        resources2 = rm.get_resources([resources[-1][rm.resource_type.id]])
+        self.maxDiff = None
+        # placebo mangles the utc tz with its own class, also our account rewriter
+        # mangles the timestamp string :-(
+        for k in ('ClusterCreateTime', 'SnapshotCreateTime'):
+            for r in (resources[-1], resources2[0]):
+                r.pop(k)
+        self.assertEqual(resources[-1], resources2[0])
 
     def test_rdscluster_snapshot_simple(self):
         session_factory = self.replay_flight_data("test_rdscluster_snapshot_simple")
@@ -296,6 +403,41 @@ class RDSClusterSnapshotTest(BaseTest):
         )
         resources = p.run()
         self.assertEqual(len(resources), 2)
+
+    def test_rdscluster_snapshot_get_resources(self):
+        session_factory = self.replay_flight_data('test_rds_cluster_snapshot_get_resources')
+        p = self.load_policy(
+            {
+                'name': 'rdscluster-get',
+                'resource': 'aws.rds-cluster-snapshot'
+            },
+            session_factory=session_factory)
+        resources = p.resource_manager.get_resources([
+            'test-cluster-final-snapshot',
+            'invalid',
+            'rds:database-1-2020-04-27-05-58'])
+        self.assertEqual(len(resources), 2)
+        self.assertEqual(
+            {'rds:database-1-2020-04-27-05-58', 'test-cluster-final-snapshot'},
+            {r['DBClusterSnapshotIdentifier'] for r in resources})
+        self.assertEqual(
+            {len(r['Tags']) for r in resources},
+            {1, 0})
+
+    def test_rdscluster_snapshot_cross_account(self):
+        session_factory = self.replay_flight_data('test_rds_cluster_snapshot_cross_account')
+        p = self.load_policy(
+            {
+                'name': 'rdscluster-snapshot-xaccount',
+                'resource': 'aws.rds-cluster-snapshot',
+                'filters': [
+                    {'type': 'cross-account'}]
+            },
+            session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['DBClusterSnapshotIdentifier'], 'test-cluster-final-snapshot')
+        self.assertEqual(resources[0]['c7n:CrossAccountViolations'], ['12345678910'])
 
     def test_rdscluster_snapshot_simple_filter(self):
         session_factory = self.replay_flight_data("test_rdscluster_snapshot_simple")

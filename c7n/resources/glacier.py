@@ -11,15 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
 
 import json
 
 from c7n.actions import RemovePolicyBase
 from c7n.filters import CrossAccountAccessFilter
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.manager import resources
 from c7n.utils import get_retry, local_session
 
@@ -30,13 +28,12 @@ class Glacier(QueryResourceManager):
     permissions = ('glacier:ListTagsForVault',)
     retry = staticmethod(get_retry(('Throttled',)))
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'glacier'
         enum_spec = ('list_vaults', 'VaultList', None)
-        name = "VaultName"
-        id = "VaultARN"
-        filter_name = None
-        dimension = None
+        name = id = "VaultName"
+        arn = "VaultARN"
+        arn_type = 'vaults'
         universal_taggable = True
 
     def augment(self, resources):
@@ -66,7 +63,7 @@ class GlacierCrossAccountAccessFilter(CrossAccountAccessFilter):
         .. code-block:
 
             policies:
-              - name: glacier-cross-account
+              - name: check-glacier-cross-account
                 resource: glacier
                 filters:
                   - type: cross-account
@@ -108,7 +105,7 @@ class RemovePolicyStatement(RemovePolicyBase):
 
             policies:
               - name: glacier-cross-account
-                resource: glaier
+                resource: glacier
                 filters:
                   - type: cross-account
                 actions:

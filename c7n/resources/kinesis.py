@@ -11,15 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import jmespath
 
 from c7n.actions import Action
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.tags import universal_augment
 from c7n.utils import local_session, type_schema, get_retry
+
+
+class DescribeStream(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(self.manager, super().augment(resources))
 
 
 @resources.register('kinesis')
@@ -28,22 +32,21 @@ class KinesisStream(QueryResourceManager):
         get_retry((
             'LimitExceededException',)))
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'kinesis'
-        type = 'stream'
+        arn_type = 'stream'
         enum_spec = ('list_streams', 'StreamNames', None)
         detail_spec = (
             'describe_stream', 'StreamName', None, 'StreamDescription')
         name = id = 'StreamName'
-        filter_name = None
-        filter_type = None
-        date = None
         dimension = 'StreamName'
         universal_taggable = True
+        cfn_type = 'AWS::Kinesis::Stream'
 
-    def augment(self, resources):
-        return universal_augment(
-            self, super(KinesisStream, self).augment(resources))
+    source_mapping = {
+        'describe': DescribeStream,
+        'config': ConfigSource
+    }
 
 
 @KinesisStream.action_registry.register('encrypt')
@@ -53,7 +56,9 @@ class Encrypt(Action):
                          key={'type': 'string'},
                          required=('key',))
 
-    permissions = ("kinesis:UpdateStream",)
+    # not see any documentation on what permission is actually neeeded.
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/list_amazonkinesis.html
+    permissions = ("kinesis:UpdateShardCount",)
 
     def process(self, resources):
         # get KeyId
@@ -91,21 +96,32 @@ class Delete(Action):
                 StreamName=r['StreamName'])
 
 
+class DescribeDeliveryStream(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(self.manager, super().augment(resources))
+
+
 @resources.register('firehose')
 class DeliveryStream(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'firehose'
-        type = 'deliverystream'
+        arn_type = 'deliverystream'
         enum_spec = ('list_delivery_streams', 'DeliveryStreamNames', None)
         detail_spec = (
             'describe_delivery_stream', 'DeliveryStreamName', None,
             'DeliveryStreamDescription')
         name = id = 'DeliveryStreamName'
-        filter_name = None
-        filter_type = None
         date = 'CreateTimestamp'
         dimension = 'DeliveryStreamName'
+        universal_taggable = object()
+        cfn_type = 'AWS::KinesisFirehose::DeliveryStream'
+
+    source_mapping = {
+        'describe': DescribeDeliveryStream,
+        'config': ConfigSource
+    }
 
 
 @DeliveryStream.action_registry.register('delete')
@@ -213,19 +229,30 @@ class FirehoseEncryptS3Destination(Action):
                 client.update_destination(**params)
 
 
+class DescribeApp(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(self.manager, super().augment(resources))
+
+
 @resources.register('kinesis-analytics')
 class AnalyticsApp(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "kinesisanalytics"
         enum_spec = ('list_applications', 'ApplicationSummaries', None)
         detail_spec = ('describe_application', 'ApplicationName',
                        'ApplicationName', 'ApplicationDetail')
         name = "ApplicationName"
-        id = "ApplicationARN"
-        dimension = None
-        filter_name = None
-        filter_type = None
+        arn = id = "ApplicationARN"
+        arn_type = 'application'
+        universal_taggable = object()
+        cfn_type = 'AWS::KinesisAnalytics::Application'
+
+    source_mapping = {
+        'config': ConfigSource,
+        'describe': DescribeApp
+    }
 
 
 @AnalyticsApp.action_registry.register('delete')

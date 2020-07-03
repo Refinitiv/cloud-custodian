@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from .common import BaseTest, functional
 
 import base64
+import os
 import json
 import time
 import tempfile
@@ -38,10 +37,14 @@ class NotifyTest(BaseTest):
                 time.sleep(60)
 
         self.addCleanup(cleanup)
-        temp_file = tempfile.NamedTemporaryFile(mode="w")
+        temp_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
         json.dump({"emails": ["me@example.com"]}, temp_file)
         temp_file.flush()
+
+        self.addCleanup(os.unlink, temp_file.name)
         self.addCleanup(temp_file.close)
+
+        url = "file:///%s" % temp_file.name.replace('\\', '/')
 
         policy = self.load_policy(
             {
@@ -53,12 +56,12 @@ class NotifyTest(BaseTest):
                         "type": "notify",
                         "to": ["to@example.com"],
                         "to_from": {
-                            "url": "file://%s" % temp_file.name,
+                            "url": url,
                             "format": "json",
                             "expr": "emails",
                         },
                         "cc_from": {
-                            "url": "file://%s" % temp_file.name,
+                            "url": url,
                             "format": "json",
                             "expr": "emails",
                         },
@@ -81,17 +84,15 @@ class NotifyTest(BaseTest):
         body = json.loads(zlib.decompress(base64.b64decode(messages[0]["Body"])))
         self.assertEqual(
             set(body.keys()),
-            set(
-                (
-                    "account_id",
-                    "action",
-                    "event",
-                    "policy",
-                    "region",
-                    "account",
-                    "resources",
-                )
-            ),
+            {
+                "account_id",
+                "action",
+                "event",
+                "policy",
+                "region",
+                "account",
+                "resources",
+            },
         )
 
     def test_resource_prep(self):

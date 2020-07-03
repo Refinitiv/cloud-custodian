@@ -18,21 +18,20 @@ a variety of sinks.
 See docs/usage/outputs.rst
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import contextlib
-from datetime import datetime
-import json
+import datetime
 import gzip
 import logging
 import os
 import shutil
+import tempfile
 import time
 import uuid
 
 
 from c7n.exceptions import InvalidOutputConfig
 from c7n.registry import PluginRegistry
+from c7n.utils import parse_url_config
 
 try:
     import psutil
@@ -54,12 +53,14 @@ class OutputRegistry(PluginRegistry):
     def select(self, selector, ctx):
         if not selector:
             return self['default'](ctx, {'url': selector})
-        if self.default_protocol and '://' not in selector:
+        if '://' not in selector and selector in self:
+            selector = "{}://".format(selector)
+        elif self.default_protocol and '://' not in selector:
             selector = "{}://{}".format(
                 self.default_protocol, selector)
         for k in self.keys():
             if selector.startswith(k):
-                return self[k](ctx, {'url': selector})
+                return self[k](ctx, parse_url_config(selector))
         raise InvalidOutputConfig("Invalid %s: %s" % (
             self.plugin_type,
             selector))
@@ -93,7 +94,7 @@ sys_stats_outputs = OutputRegistry('c7n.output.sys_stats')
 
 
 @tracer_outputs.register('default')
-class NullTracer(object):
+class NullTracer:
     """Tracing provides for detailed analytics of a policy execution.
 
     Uses native cloud provider integration (xray, stack driver trace).
@@ -117,7 +118,7 @@ class NullTracer(object):
         """
 
 
-class DeltaStats(object):
+class DeltaStats:
     """Capture stats (dictionary of string->integer) as a stack.
 
     Popping the stack automatically creates a delta of the last
@@ -149,7 +150,7 @@ class DeltaStats(object):
 
 @sys_stats_outputs.register('default')
 @api_stats_outputs.register('default')
-class NullStats(object):
+class NullStats:
     """Execution statistics/metrics collection.
 
     Encompasses concrete implementations over system stats (memory, cpu, cache size)
@@ -247,7 +248,7 @@ class SystemStats(DeltaStats):
         return snapshot
 
 
-class Metrics(object):
+class Metrics:
 
     permissions = ()
     namespace = DEFAULT_NAMESPACE
@@ -303,7 +304,7 @@ class LogMetrics(Metrics):
     def _format_metric(self, key, value, unit, dimensions):
         d = {
             "MetricName": key,
-            "Timestamp": datetime.now(),
+            "Timestamp": datetime.datetime.now(),
             "Value": value,
             "Unit": unit}
         d["Dimensions"] = [
@@ -322,7 +323,7 @@ class LogMetrics(Metrics):
         return res
 
 
-class LogOutput(object):
+class LogOutput:
 
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
@@ -346,12 +347,16 @@ class LogOutput(object):
 
     def join_log(self):
         self.handler = self.get_handler()
+        if self.handler is None:
+            return
         self.handler.setLevel(logging.DEBUG)
         self.handler.setFormatter(logging.Formatter(self.log_format))
         mlog = logging.getLogger('custodian')
         mlog.addHandler(self.handler)
 
     def leave_log(self):
+        if self.handler is None:
+            return
         mlog = logging.getLogger('custodian')
         mlog.removeHandler(self.handler)
         self.handler.flush()
@@ -361,15 +366,55 @@ class LogOutput(object):
 @log_outputs.register('default')
 class LogFile(LogOutput):
 
+    def __repr__(self):
+        return "<LogFile file://%s>" % self.log_path
+
+    @property
+    def log_path(self):
+        return os.path.join(
+            self.ctx.log_dir, 'custodian-run.log')
+
     def get_handler(self):
-        return logging.FileHandler(
-            os.path.join(
-                self.ctx.log_dir, 'custodian-run.log'))
+        return logging.FileHandler(self.log_path)
+
+
+@log_outputs.register('null')
+class NullLog(LogOutput):
+    # default - for unit tests
+
+    def __repr__(self):
+        return "<Null Log>"
+
+    @property
+    def log_path(self):
+        return "xyz/log.txt"
+
+    def get_handler(self):
+        return None
+
+
+@blob_outputs.register('null')
+class NullBlobOutput:
+    # default - for unit tests
+
+    def __init__(self, ctx, config):
+        self.ctx = ctx
+        self.config = config
+        self.root_dir = 'xyz'
+
+    def __repr__(self):
+        return "<null blob output>"
+
+    def __enter__(self):
+        return
+
+    def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
+        return
 
 
 @blob_outputs.register('file')
 @blob_outputs.register('default')
-class DirectoryOutput(object):
+class DirectoryOutput:
 
     permissions = ()
 
@@ -415,20 +460,49 @@ class DirectoryOutput(object):
             'account_id': self.ctx.options.account_id,
             'region': self.ctx.options.region,
             'policy_name': self.ctx.policy.name,
-            'now': datetime.utcnow(),
+            'now': datetime.datetime.utcnow(),
             'uuid': str(uuid.uuid4())}
         return data
 
-    def get_resource_set(self):
-        record_path = os.path.join(self.root_dir, 'resources.json')
 
-        if not os.path.exists(record_path):
-            return []
+class BlobOutput(DirectoryOutput):
 
-        mdate = datetime.fromtimestamp(
-            os.stat(record_path).st_ctime)
+    log = logging.getLogger('custodian.output.blob')
 
-        with open(record_path) as fh:
-            records = json.load(fh)
-            [r.__setitem__('CustodianDate', mdate) for r in records]
-            return records
+    def __init__(self, ctx, config):
+        self.ctx = ctx
+        # we allow format strings in output urls so reparse config
+        # post interpolation.
+        self.config = parse_url_config(self.get_output_path(config['url']))
+        self.bucket = self.config.netloc
+        self.key_prefix = self.config.path.strip('/')
+        self.root_dir = tempfile.mkdtemp()
+
+    def __repr__(self):
+        return "<output:%s to bucket:%s prefix:%s>" % (
+            self.type,
+            self.bucket,
+            self.key_prefix)
+
+    def get_output_path(self, output_url):
+        if '{' not in output_url:
+            date_path = datetime.datetime.utcnow().strftime('%Y/%m/%d/%H')
+            return "/".join([s.strip('/') for s in [
+                output_url, self.ctx.policy.name, date_path]])
+        return output_url.format(**self.get_output_vars()).rstrip('/')
+
+    def __exit__(self, exc_type=None, exc_value=None, exc_traceback=None):
+        self.log.debug("%s: uploading policy logs", self.type)
+        self.compress()
+        self.upload()
+        shutil.rmtree(self.root_dir)
+        self.log.debug("%s: policy logs uploaded", self.type)
+
+    def upload(self):
+        for root, dirs, files in os.walk(self.root_dir):
+            for f in files:
+                key = "/".join(filter(None, [self.key_prefix, root[len(self.root_dir):], f]))
+                self.upload_file(os.path.join(root, f), key)
+
+    def upload_file(self, path, key):
+        raise NotImplementedError("subclass responsibility")

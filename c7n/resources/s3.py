@@ -37,8 +37,6 @@ Actions:
    delivery.
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import copy
 import functools
 import json
@@ -49,14 +47,13 @@ import os
 import time
 import ssl
 
-import six
-
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from collections import defaultdict
 from concurrent.futures import as_completed
 from dateutil.parser import parse as parse_date
+
 try:
     from urllib3.exceptions import SSLError
 except ImportError:
@@ -65,13 +62,14 @@ except ImportError:
 
 from c7n.actions import (
     ActionRegistry, BaseAction, PutMetric, RemovePolicyBase)
-from c7n.actions.securityhub import PostFinding
 from c7n.exceptions import PolicyValidationError
 from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter,
     ValueFilter)
 from c7n.manager import resources
+from c7n.output import NullBlobOutput
 from c7n import query
+from c7n.resources.securityhub import PostFinding
 from c7n.tags import RemoveTag, Tag, TagActionFilter, TagDelayedAction
 from c7n.utils import (
     chunks, local_session, set_annotation, type_schema, filter_empty,
@@ -88,38 +86,6 @@ actions.register('put-metric', PutMetric)
 MAX_COPY_SIZE = 1024 * 1024 * 1024 * 2
 
 
-@resources.register('s3')
-class S3(query.QueryResourceManager):
-
-    class resource_type(object):
-        service = 's3'
-        type = 'bucket'
-        enum_spec = ('list_buckets', 'Buckets[]', None)
-        detail_spec = ('list_objects', 'Bucket', 'Contents[]')
-        name = id = 'Name'
-        filter_name = None
-        date = 'CreationDate'
-        dimension = 'BucketName'
-        config_type = 'AWS::S3::Bucket'
-
-    filter_registry = filters
-    action_registry = actions
-
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeS3(self)
-        elif source_type == 'config':
-            return ConfigS3(self)
-        else:
-            return super(S3, self).get_source(source_type)
-
-    @classmethod
-    def get_permissions(cls):
-        perms = ["s3:ListAllMyBuckets"]
-        perms.extend([n[0] for n in S3_AUGMENT_TABLE])
-        return perms
-
-
 class DescribeS3(query.DescribeSource):
 
     def augment(self, buckets):
@@ -134,11 +100,23 @@ class DescribeS3(query.DescribeSource):
 
 class ConfigS3(query.ConfigSource):
 
+    # normalize config's janky idiosyncratic bespoke formating to the
+    # standard describe api responses.
+
+    def get_query_params(self, query):
+        q = super(ConfigS3, self).get_query_params(query)
+        if 'expr' in q:
+            q['expr'] = q['expr'].replace('select ', 'select awsRegion, ')
+        return q
+
     def load_resource(self, item):
         resource = super(ConfigS3, self).load_resource(item)
         cfg = item['supplementaryConfiguration']
-        if item['awsRegion'] != 'us-east-1':  # aka standard
+        # aka standard
+        if 'awsRegion' in item and item['awsRegion'] != 'us-east-1':
             resource['Location'] = {'LocationConstraint': item['awsRegion']}
+        else:
+            resource['Location'] = {}
 
         # owner is under acl per describe
         resource.pop('Owner', None)
@@ -152,7 +130,7 @@ class ConfigS3(query.ConfigSource):
                 raise ValueError("unhandled supplementary config %s", k)
                 continue
             v = cfg[k]
-            if isinstance(cfg[k], six.string_types):
+            if isinstance(cfg[k], str):
                 v = json.loads(cfg[k])
             method(resource, v)
 
@@ -175,7 +153,7 @@ class ConfigS3(query.ConfigSource):
 
     def handle_AccessControlList(self, resource, item_value):
         # double serialized in config for some reason
-        if isinstance(item_value, six.string_types):
+        if isinstance(item_value, str):
             item_value = json.loads(item_value)
 
         resource['Acl'] = {}
@@ -205,7 +183,8 @@ class ConfigS3(query.ConfigSource):
         return
 
     def handle_BucketLoggingConfiguration(self, resource, item_value):
-        if item_value['destinationBucketName'] is None:
+        if ('destinationBucketName' not in item_value or
+                item_value['destinationBucketName'] is None):
             return {}
         resource[u'Logging'] = {
             'TargetBucket': item_value['destinationBucketName'],
@@ -221,7 +200,7 @@ class ConfigS3(query.ConfigSource):
                     ('Date', 'expirationDate'),
                     ('ExpiredObjectDeleteMarker', 'expiredObjectDeleteMarker'),
                     ('Days', 'expirationInDays')):
-                if r[ck] and r[ck] != -1:
+                if ck in r and r[ck] and r[ck] != -1:
                     expiry[ek] = r[ck]
             if expiry:
                 rr['Expiration'] = expiry
@@ -316,6 +295,7 @@ class ConfigS3(query.ConfigSource):
                 'Status': r['status'],
                 'Prefix': r['prefix'],
                 'Destination': {
+                    'Account': r['destinationConfig']['Account'],
                     'Bucket': r['destinationConfig']['bucketARN']}
             }
             if r['destinationConfig']['storageClass']:
@@ -375,6 +355,36 @@ class ConfigS3(query.ConfigSource):
         resource['Website'] = website
 
 
+@resources.register('s3')
+class S3(query.QueryResourceManager):
+
+    class resource_type(query.TypeInfo):
+        service = 's3'
+        arn_type = ''
+        enum_spec = ('list_buckets', 'Buckets[]', None)
+        detail_spec = ('list_objects', 'Bucket', 'Contents[]')
+        name = id = 'Name'
+        date = 'CreationDate'
+        dimension = 'BucketName'
+        cfn_type = config_type = 'AWS::S3::Bucket'
+
+    filter_registry = filters
+    action_registry = actions
+    source_mapping = {
+        'describe': DescribeS3,
+        'config': ConfigS3
+    }
+
+    def get_arns(self, resources):
+        return ["arn:aws:s3:::{}".format(r["Name"]) for r in resources]
+
+    @classmethod
+    def get_permissions(cls):
+        perms = ["s3:ListAllMyBuckets"]
+        perms.extend([n[-1] for n in S3_AUGMENT_TABLE])
+        return perms
+
+
 S3_CONFIG_SUPPLEMENT_NULL_MAP = {
     'BucketLoggingConfiguration': u'{"destinationBucketName":null,"logFilePrefix":null}',
     'BucketPolicy': u'{"policyText":null}',
@@ -389,16 +399,19 @@ S3_CONFIG_SUPPLEMENT_NULL_MAP = {
 }
 
 S3_AUGMENT_TABLE = (
-    ('get_bucket_location', 'Location', None, None),
-    ('get_bucket_tagging', 'Tags', [], 'TagSet'),
-    ('get_bucket_policy', 'Policy', None, 'Policy'),
-    ('get_bucket_acl', 'Acl', None, None),
-    ('get_bucket_replication', 'Replication', None, None),
-    ('get_bucket_versioning', 'Versioning', None, None),
-    ('get_bucket_website', 'Website', None, None),
-    ('get_bucket_logging', 'Logging', None, 'LoggingEnabled'),
-    ('get_bucket_notification_configuration', 'Notification', None, None),
-    ('get_bucket_lifecycle_configuration', 'Lifecycle', None, None),
+    ('get_bucket_location', 'Location', {}, None, 's3:GetBucketLocation'),
+    ('get_bucket_tagging', 'Tags', [], 'TagSet', 's3:GetBucketTagging'),
+    ('get_bucket_policy', 'Policy', None, 'Policy', 's3:GetBucketPolicy'),
+    ('get_bucket_acl', 'Acl', None, None, 's3:GetBucketAcl'),
+    ('get_bucket_replication',
+     'Replication', None, None, 's3:GetReplicationConfiguration'),
+    ('get_bucket_versioning', 'Versioning', None, None, 's3:GetBucketVersioning'),
+    ('get_bucket_website', 'Website', None, None, 's3:GetBucketWebsite'),
+    ('get_bucket_logging', 'Logging', None, 'LoggingEnabled', 's3:GetBucketLogging'),
+    ('get_bucket_notification_configuration',
+     'Notification', None, None, 's3:GetBucketNotification'),
+    ('get_bucket_lifecycle_configuration',
+     'Lifecycle', None, None, 's3:GetLifecycleConfiguration'),
     #        ('get_bucket_cors', 'Cors'),
 )
 
@@ -414,7 +427,8 @@ def assemble_bucket(item):
     # Bucket Location, Current Client Location, Default Location
     b_location = c_location = location = "us-east-1"
     methods = list(S3_AUGMENT_TABLE)
-    for m, k, default, select in methods:
+    for minfo in methods:
+        m, k, default, select = minfo[:4]
         try:
             method = getattr(c, m)
             v = method(Bucket=b['Name'])
@@ -458,7 +472,8 @@ def assemble_bucket(item):
         # As soon as we learn location (which generally works)
         if k == 'Location' and v is not None:
             b_location = v.get('LocationConstraint')
-            # Location == region for all cases but EU per https://goo.gl/iXdpnl
+            # Location == region for all cases but EU
+            # https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucketGETlocation.html
             if b_location is None:
                 b_location = "us-east-1"
             elif b_location == 'EU':
@@ -552,11 +567,12 @@ class S3Metrics(MetricsFilter):
     """
 
     def get_dimensions(self, resource):
-        return [
-            {'Name': 'BucketName',
-             'Value': resource['Name']},
-            {'Name': 'StorageType',
-             'Value': 'AllStorageTypes'}]
+        dims = [{'Name': 'BucketName', 'Value': resource['Name']}]
+        if (self.data['name'] == 'NumberOfObjects' and
+                'dimensions' not in self.data):
+            dims.append(
+                {'Name': 'StorageType', 'Value': 'AllStorageTypes'})
+        return dims
 
 
 @filters.register('cross-account')
@@ -579,11 +595,14 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
     def get_accounts(self):
         """add in elb access by default
 
-        ELB Accounts by region http://goo.gl/a8MXxd
+        ELB Accounts by region
+         https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/enable-access-logs.html
 
-        Redshift Accounts by region https://goo.gl/MKWPTT
+        Redshift Accounts by region
+         https://docs.aws.amazon.com/redshift/latest/mgmt/db-auditing.html#rs-db-auditing-cloud-trail-rs-acct-ids
 
-        Cloudtrail Accounts by region https://goo.gl/kWQk9D
+        Cloudtrail Accounts by region
+         https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-supported-regions.html
         """
         accounts = super(S3CrossAccountFilter, self).get_accounts()
         return accounts.union(
@@ -645,17 +664,23 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
 class GlobalGrantsFilter(Filter):
     """Filters for all S3 buckets that have global-grants
 
+    *Note* by default this filter allows for read access
+    if the bucket has been configured as a website. This
+    can be disabled per the example below.
+
     :example:
 
     .. code-block:: yaml
 
-            policies:
-              - name: s3-delete-global-grants
-                resource: s3
-                filters:
-                  - type: global-grants
-                actions:
-                  - delete-global-grants
+       policies:
+         - name: remove-global-grants
+           resource: s3
+           filters:
+            - type: global-grants
+              allow_website: false
+           actions:
+            - delete-global-grants
+
     """
 
     schema = type_schema(
@@ -727,16 +752,30 @@ class BucketActionBase(BaseAction):
             return results
 
 
+class BucketFilterBase(Filter):
+    def get_std_format_args(self, bucket):
+        return {
+            'account_id': self.manager.config.account_id,
+            'region': self.manager.config.region,
+            'bucket_name': bucket['Name'],
+            'bucket_region': get_region(bucket)
+        }
+
+
 @S3.action_registry.register("post-finding")
 class BucketFinding(PostFinding):
+
+    resource_type = 'AwsS3Bucket'
+
     def format_resource(self, r):
         owner = r.get("Acl", {}).get("Owner", {})
         resource = {
-            "Type": "AwsS3Bucket",
-            "Id": "arn:aws:::{}".format(r["Name"]),
+            "Type": self.resource_type,
+            "Id": "arn:aws:s3:::{}".format(r["Name"]),
             "Region": get_region(r),
             "Tags": {t["Key"]: t["Value"] for t in r.get("Tags", [])},
-            "Details": {"AwsS3Bucket": {"OwnerId": owner.get('ID', 'Unknown')}}
+            "Details": {self.resource_type: {
+                "OwnerId": owner.get('ID', 'Unknown')}}
         }
 
         if "DisplayName" in owner:
@@ -746,7 +785,7 @@ class BucketFinding(PostFinding):
 
 
 @filters.register('has-statement')
-class HasStatementFilter(Filter):
+class HasStatementFilter(BucketFilterBase):
     """Find buckets with set of policy statements.
 
     :example:
@@ -816,7 +855,8 @@ class HasStatementFilter(Filter):
             if s.get('Sid') in required:
                 required.remove(s['Sid'])
 
-        required_statements = list(self.data.get('statements', []))
+        required_statements = format_string_values(list(self.data.get('statements', [])),
+                                                   **self.get_std_format_args(b))
         for required_statement in required_statements:
             for statement in statements:
                 found = 0
@@ -956,7 +996,7 @@ class BucketNotificationFilter(ValueFilter):
         required=['kind'],
         kind={'type': 'string', 'enum': ['lambda', 'sns', 'sqs']},
         rinherit=ValueFilter.schema)
-
+    schema_alias = False
     annotation_key = 'c7n:MatchedNotificationConfigurationIds'
 
     permissions = ('s3:GetBucketNotification',)
@@ -982,6 +1022,93 @@ class BucketNotificationFilter(ValueFilter):
                     config['Id'])
                 found = True
         return found
+
+
+@filters.register('bucket-logging')
+class BucketLoggingFilter(Filter):
+    """Filter based on bucket logging configuration.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: add-bucket-logging-if-missing
+                resource: s3
+                filters:
+                  - type: bucket-logging
+                    op: disabled
+                actions:
+                  - type: toggle-logging
+                    target_bucket: "{account_id}-{region}-s3-logs"
+                    target_prefix: "{source_bucket_name}/"
+
+            policies:
+              - name: update-incorrect-or-missing-logging
+                resource: s3
+                filters:
+                  - type: bucket-logging
+                    op: not-equal
+                    target_bucket: "{account_id}-{region}-s3-logs"
+                    target_prefix: "{account}/{source_bucket_name}/"
+                actions:
+                  - type: toggle-logging
+                    target_bucket: "{account_id}-{region}-s3-logs"
+                    target_prefix: "{account}/{source_bucket_name}/"
+    """
+
+    schema = type_schema(
+        'bucket-logging',
+        op={'enum': ['enabled', 'disabled', 'equal', 'not-equal', 'eq', 'ne']},
+        required=['op'],
+        target_bucket={'type': 'string'},
+        target_prefix={'type': 'string'})
+    schema_alias = False
+    account_name = None
+
+    permissions = ("s3:GetBucketLogging", "iam:ListAccountAliases")
+
+    def process(self, buckets, event=None):
+        return list(filter(None, map(self.process_bucket, buckets)))
+
+    def process_bucket(self, b):
+        if self.match_bucket(b):
+            return b
+
+    def match_bucket(self, b):
+        op = self.data.get('op')
+
+        logging = b.get('Logging', {})
+        if op == 'disabled':
+            return logging == {}
+        elif op == 'enabled':
+            return logging != {}
+
+        if self.account_name is None:
+            session = local_session(self.manager.session_factory)
+            self.account_name = get_account_alias_from_sts(session)
+
+        variables = {
+            'account_id': self.manager.config.account_id,
+            'account': self.account_name,
+            'region': self.manager.config.region,
+            'source_bucket_name': b['Name'],
+            'target_bucket_name': self.data.get('target_bucket'),
+            'target_prefix': self.data.get('target_prefix'),
+        }
+        data = format_string_values(self.data, **variables)
+        target_bucket = data.get('target_bucket')
+        target_prefix = data.get('target_prefix', b['Name'] + '/')
+
+        target_config = {
+            "TargetBucket": target_bucket,
+            "TargetPrefix": target_prefix
+        } if target_bucket else {}
+
+        if op in ('not-equal', 'ne'):
+            return logging != target_config
+        else:
+            return logging == target_config
 
 
 @actions.register('delete-bucket-notification')
@@ -1010,7 +1137,7 @@ class DeleteBucketNotification(BucketActionBase):
 
         cfg = defaultdict(list)
 
-        for t in six.itervalues(BucketNotificationFilter.FIELDS):
+        for t in BucketNotificationFilter.FIELDS.values():
             for c in n.get(t, []):
                 if c['Id'] not in statement_ids:
                     cfg[t].append(c)
@@ -1063,7 +1190,6 @@ class SetPolicyStatement(BucketActionBase):
         **{
             'statements': {
                 'type': 'array',
-                'required': True,
                 'items': {
                     'type': 'object',
                     'properties': {
@@ -1097,19 +1223,23 @@ class SetPolicyStatement(BucketActionBase):
     def process_bucket(self, bucket):
         policy = bucket.get('Policy') or '{}'
 
-        fmtargs = self.get_std_format_args(bucket)
+        target_statements = format_string_values(
+            copy.deepcopy({s['Sid']: s for s in self.data.get('statements', [])}),
+            **self.get_std_format_args(bucket))
 
         policy = json.loads(policy)
-        current = {s['Sid']: s for s in policy.get('Statement', [])}
-        new = copy.deepcopy(current)
-        additional = {s['Sid']: s for s in self.data.get('statements', [])}
-        additional = format_string_values(additional, **fmtargs)
-        new.update(additional)
-        if new == current:
+        bucket_statements = policy.setdefault('Statement', [])
+
+        for s in bucket_statements:
+            if s.get('Sid') not in target_statements:
+                continue
+            if s == target_statements[s['Sid']]:
+                target_statements.pop(s['Sid'])
+
+        if not target_statements:
             return
 
-        statements = list(new.values())
-        policy['Statement'] = statements
+        bucket_statements.extend(target_statements.values())
         policy = json.dumps(policy)
 
         s3 = bucket_client(local_session(self.manager.session_factory), bucket)
@@ -1174,6 +1304,215 @@ class RemovePolicyStatement(RemovePolicyBase):
         else:
             s3.put_bucket_policy(Bucket=bucket['Name'], Policy=json.dumps(p))
         return {'Name': bucket['Name'], 'State': 'PolicyRemoved', 'Statements': found}
+
+
+@actions.register('set-replication')
+class SetBucketReplicationConfig(BucketActionBase):
+    """Action to add or remove replication configuration statement from S3 buckets
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: s3-unapproved-account-replication
+                resource: s3
+                filters:
+                  - type: value
+                    key: Replication.ReplicationConfiguration.Rules[].Destination.Account
+                    value: present
+                  - type: value
+                    key: Replication.ReplicationConfiguration.Rules[].Destination.Account
+                    value_from:
+                      url: 's3:///path/to/file.json'
+                      format: json
+                      expr: "approved_accounts.*"
+                    op: ni
+                actions:
+                  - type: set-replication
+                    state: enable
+    """
+    schema = type_schema(
+        'set-replication',
+        state={'type': 'string', 'enum': ['enable', 'disable', 'remove']})
+    permissions = ("s3:GetReplicationConfiguration", "s3:PutReplicationConfiguration")
+
+    def process(self, buckets):
+        with self.executor_factory(max_workers=3) as w:
+            futures = {w.submit(self.process_bucket, bucket): bucket for bucket in buckets}
+            errors = []
+            for future in as_completed(futures):
+                bucket = futures[future]
+                try:
+                    future.result()
+                except ClientError as e:
+                    errors.append("Message: %s Bucket: %s", e, bucket['Name'])
+            if errors:
+                raise Exception('\n'.join(map(str, errors)))
+
+    def process_bucket(self, bucket):
+        s3 = bucket_client(local_session(self.manager.session_factory), bucket)
+        state = self.data.get('state')
+        if state is not None:
+            if state == 'remove':
+                s3.delete_bucket_replication(Bucket=bucket['Name'])
+                return {'Name': bucket['Name'], 'State': 'ReplicationConfigRemoved'}
+            if state in ('enable', 'disable'):
+                config = s3.get_bucket_replication(Bucket=bucket['Name'])
+                for rule in config['ReplicationConfiguration']['Rules']:
+                    rule['Status'] = 'Enabled' if state == 'enable' else 'Disabled'
+                s3.put_bucket_replication(
+                    Bucket=bucket['Name'],
+                    ReplicationConfiguration=config['ReplicationConfiguration']
+                )
+                return {'Name': bucket['Name'], 'State': 'ReplicationConfigUpdated'}
+
+
+@filters.register('check-public-block')
+class FilterPublicBlock(Filter):
+    """Filter for s3 bucket public blocks
+
+    If no filter paramaters are provided it checks to see if any are unset or False.
+
+    If parameters are provided only the provided ones are checked.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: CheckForPublicAclBlock-Off
+                resource: s3
+                region: us-east-1
+                filters:
+                  - type: check-public-block
+                    BlockPublicAcls: true
+                    BlockPublicPolicy: true
+    """
+
+    schema = type_schema(
+        'check-public-block',
+        BlockPublicAcls={'type': 'boolean'},
+        IgnorePublicAcls={'type': 'boolean'},
+        BlockPublicPolicy={'type': 'boolean'},
+        RestrictPublicBuckets={'type': 'boolean'})
+    permissions = ("s3:GetBucketPublicAccessBlock",)
+    keys = (
+        'BlockPublicPolicy', 'BlockPublicAcls', 'IgnorePublicAcls', 'RestrictPublicBuckets')
+    annotation_key = 'c7n:PublicAccessBlock'
+
+    def process(self, buckets, event=None):
+        results = []
+        with self.executor_factory(max_workers=2) as w:
+            futures = {w.submit(self.process_bucket, bucket): bucket for bucket in buckets}
+            for f in as_completed(futures):
+                if f.result():
+                    results.append(futures[f])
+        return results
+
+    def process_bucket(self, bucket):
+        s3 = bucket_client(local_session(self.manager.session_factory), bucket)
+        config = dict(bucket.get(self.annotation_key, {key: False for key in self.keys}))
+        if self.annotation_key not in bucket:
+            try:
+                config = s3.get_public_access_block(
+                    Bucket=bucket['Name'])['PublicAccessBlockConfiguration']
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
+                    raise
+            bucket[self.annotation_key] = config
+        return self.matches_filter(config)
+
+    def matches_filter(self, config):
+        key_set = [key for key in self.keys if key in self.data]
+        if key_set:
+            return all([self.data.get(key) is config[key] for key in key_set])
+        else:
+            return not all(config.values())
+
+
+@actions.register('set-public-block')
+class SetPublicBlock(BucketActionBase):
+    """Action to update Public Access blocks on S3 buckets
+
+    If no action parameters are provided all settings will be set to the `state`, which defaults
+
+    If action parameters are provided, those will be set and other extant values preserved.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: s3-public-block-enable-all
+                resource: s3
+                filters:
+                  - type: check-public-block
+                actions:
+                  - type: set-public-block
+
+            policies:
+              - name: s3-public-block-disable-all
+                resource: s3
+                filters:
+                  - type: check-public-block
+                actions:
+                  - type: set-public-block
+                    state: false
+
+            policies:
+              - name: s3-public-block-enable-some
+                resource: s3
+                filters:
+                  - or:
+                    - type: check-public-block
+                      BlockPublicAcls: false
+                    - type: check-public-block
+                      BlockPublicPolicy: false
+                actions:
+                  - type: set-public-block
+                    BlockPublicAcls: true
+                    BlockPublicPolicy: true
+
+    """
+
+    schema = type_schema(
+        'set-public-block',
+        state={'type': 'boolean', 'default': True},
+        BlockPublicAcls={'type': 'boolean'},
+        IgnorePublicAcls={'type': 'boolean'},
+        BlockPublicPolicy={'type': 'boolean'},
+        RestrictPublicBuckets={'type': 'boolean'})
+    permissions = ("s3:GetBucketPublicAccessBlock", "s3:PutBucketPublicAccessBlock")
+    keys = FilterPublicBlock.keys
+    annotation_key = FilterPublicBlock.annotation_key
+
+    def process(self, buckets):
+        with self.executor_factory(max_workers=3) as w:
+            futures = {w.submit(self.process_bucket, bucket): bucket for bucket in buckets}
+            for future in as_completed(futures):
+                future.result()
+
+    def process_bucket(self, bucket):
+        s3 = bucket_client(local_session(self.manager.session_factory), bucket)
+        config = dict(bucket.get(self.annotation_key, {key: False for key in self.keys}))
+        if self.annotation_key not in bucket:
+            try:
+                config = s3.get_public_access_block(
+                    Bucket=bucket['Name'])['PublicAccessBlockConfiguration']
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
+                    raise
+
+        key_set = [key for key in self.keys if key in self.data]
+        if key_set:
+            for key in key_set:
+                config[key] = self.data.get(key)
+        else:
+            for key in self.keys:
+                config[key] = self.data.get('state', True)
+        s3.put_public_access_block(
+            Bucket=bucket['Name'], PublicAccessBlockConfiguration=config)
 
 
 @actions.register('toggle-versioning')
@@ -1242,7 +1581,7 @@ class ToggleLogging(BucketActionBase):
 
     Target bucket ACL must allow for WRITE and READ_ACP Permissions
     Not specifying a target_prefix will default to the current bucket name.
-    http://goo.gl/PiWWU2
+    https://docs.aws.amazon.com/AmazonS3/latest/dev/enable-logging-programming.html
 
     :example:
 
@@ -1251,12 +1590,25 @@ class ToggleLogging(BucketActionBase):
             policies:
               - name: s3-enable-logging
                 resource: s3
-                filter:
+                filters:
                   - "tag:Testing": present
                 actions:
                   - type: toggle-logging
                     target_bucket: log-bucket
-                    target_prefix: logs123
+                    target_prefix: logs123/
+
+            policies:
+              - name: s3-force-standard-logging
+                resource: s3
+                filters:
+                  - type: bucket-logging
+                    op: not-equal
+                    target_bucket: "{account_id}-{region}-s3-logs"
+                    target_prefix: "{account}/{source_bucket_name}/"
+                actions:
+                  - type: toggle-logging
+                    target_bucket: "{account_id}-{region}-s3-logs"
+                    target_prefix: "{account}/{source_bucket_name}/"
     """
     schema = type_schema(
         'toggle-logging',
@@ -1283,9 +1635,9 @@ class ToggleLogging(BucketActionBase):
 
         for r in resources:
             client = bucket_client(session, r)
-            is_logging = bool(r['Logging'])
+            is_logging = bool(r.get('Logging'))
 
-            if enabled and not is_logging:
+            if enabled:
                 variables = {
                     'account_id': self.manager.config.account_id,
                     'account': account_name,
@@ -1295,18 +1647,19 @@ class ToggleLogging(BucketActionBase):
                     'target_prefix': self.data.get('target_prefix'),
                 }
                 data = format_string_values(self.data, **variables)
-                target_prefix = data.get('target_prefix', r['Name'] + '/')
-                client.put_bucket_logging(
-                    Bucket=r['Name'],
-                    BucketLoggingStatus={
-                        'LoggingEnabled': {
-                            'TargetBucket': data.get('target_bucket'),
-                            'TargetPrefix': target_prefix}})
-                continue
+                config = {
+                    'TargetBucket': data.get('target_bucket'),
+                    'TargetPrefix': data.get('target_prefix', r['Name'] + '/')
+                }
+                if not is_logging or r.get('Logging') != config:
+                    client.put_bucket_logging(
+                        Bucket=r['Name'],
+                        BucketLoggingStatus={'LoggingEnabled': config}
+                    )
+
             elif not enabled and is_logging:
                 client.put_bucket_logging(
                     Bucket=r['Name'], BucketLoggingStatus={})
-                continue
 
 
 @actions.register('attach-encrypt')
@@ -1323,12 +1676,14 @@ class AttachLambdaEncrypt(BucketActionBase):
 
 
                 policies:
-                  - name: s3-attach-encryption-event
+                  - name: attach-lambda-encrypt
                     resource: s3
                     filters:
                       - type: missing-policy-statement
                     actions:
-                      - attach-encrypt
+                      - type: attach-encrypt
+                        role: arn:aws:iam::123456789012:role/my-role
+
     """
     schema = type_schema(
         'attach-encrypt',
@@ -1367,7 +1722,7 @@ class AttachLambdaEncrypt(BucketActionBase):
             None, self.data.get('role', self.manager.config.assume_role),
             account_id=account_id, tags=self.data.get('tags'))
 
-        regions = set([get_region(b) for b in buckets])
+        regions = {get_region(b) for b in buckets}
 
         # session managers by region
         region_sessions = {}
@@ -1501,7 +1856,7 @@ class EncryptionRequiredPolicy(BucketActionBase):
         return {'Name': b['Name'], 'State': 'PolicyAttached'}
 
 
-class BucketScanLog(object):
+class BucketScanLog:
     """Offload remediated key ids to a disk file in batches
 
     A bucket keyspace is effectively infinite, we need to store partial
@@ -1620,7 +1975,9 @@ class ScanBucket(BucketActionBase):
         return results
 
     def write_denied_buckets_file(self):
-        if self.denied_buckets and self.manager.ctx.log_dir:
+        if (self.denied_buckets and
+                self.manager.ctx.log_dir and
+                not isinstance(self.manager.ctx.output, NullBlobOutput)):
             with open(
                     os.path.join(
                         self.manager.ctx.log_dir, 'denied.json'), 'w') as fh:
@@ -1798,7 +2155,7 @@ class EncryptExtantKeys(ScanBucket):
              "remediated:%d rate:%0.2f/s time:%0.2fs"),
             object_count,
             remediated_count,
-            float(object_count) / run_time,
+            float(object_count) / run_time if run_time else 0,
             run_time)
         return results
 
@@ -2022,7 +2379,7 @@ class LogTarget(Filter):
     def get_s3_bucket_locations(buckets, self_log=False):
         """return (bucket_name, prefix) for all s3 logging targets"""
         for b in buckets:
-            if b['Logging']:
+            if b.get('Logging'):
                 if self_log:
                     if b['Name'] != b['Logging']['TargetBucket']:
                         continue
@@ -2034,7 +2391,7 @@ class LogTarget(Filter):
     def get_cloud_trail_locations(self, buckets):
         session = local_session(self.manager.session_factory)
         client = session.client('cloudtrail')
-        names = set([b['Name'] for b in buckets])
+        names = {b['Name'] for b in buckets}
         for t in client.describe_trails().get('trailList', ()):
             if t.get('S3BucketName') in names:
                 yield (t['S3BucketName'], t.get('S3KeyPrefix', ''))
@@ -2181,7 +2538,7 @@ class BucketTag(Tag):
                     value: us-east-1
     """
 
-    def process_resource_set(self, resource_set, tags):
+    def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(self.manager.session_factory, resource_set, tags)
 
 
@@ -2209,11 +2566,9 @@ class MarkBucketForOp(TagDelayedAction):
     schema = type_schema(
         'mark-for-op', rinherit=TagDelayedAction.schema)
 
-    def process_resource_set(self, resource_set, tags):
-        modify_bucket_tags(self.manager.session_factory, resource_set, tags)
-
 
 @actions.register('unmark')
+@actions.register('remove-tag')
 class RemoveBucketTag(RemoveTag):
     """Removes tag/tags from a S3 object
 
@@ -2227,14 +2582,11 @@ class RemoveBucketTag(RemoveTag):
                 filters:
                   - "tag:BucketOwner": present
                 actions:
-                  - type: unmark
+                  - type: remove-tag
                     tags: ['BucketOwner']
     """
 
-    schema = type_schema(
-        'unmark', aliases=('remove-tag',), tags={'type': 'array'})
-
-    def process_resource_set(self, resource_set, tags):
+    def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(
             self.manager.session_factory, resource_set, remove_tags=tags)
 
@@ -2293,7 +2645,7 @@ class DataEvents(Filter):
 class Inventory(ValueFilter):
     """Filter inventories for a bucket"""
     schema = type_schema('inventory', rinherit=ValueFilter.schema)
-
+    schema_alias = False
     permissions = ('s3:GetInventoryConfiguration',)
 
     def process(self, buckets, event=None):
@@ -2306,6 +2658,7 @@ class Inventory(ValueFilter):
             for f in as_completed(futures):
                 b = futures[f]
                 if f.exception():
+                    b.setdefault('c7n:DeniedMethods', []).append('GetInventoryConfiguration')
                     self.log.error(
                         "Error processing bucket: %s error: %s",
                         b['Name'], f.exception())
@@ -2341,9 +2694,12 @@ class SetInventory(BucketActionBase):
         key_id={'type': 'string', 'description': 'Optional Customer KMS KeyId for SSE-KMS'},
         versions={'enum': ['All', 'Current']},
         schedule={'enum': ['Daily', 'Weekly']},
+        format={'enum': ['CSV', 'ORC', 'Parquet']},
         fields={'type': 'array', 'items': {'enum': [
             'Size', 'LastModifiedDate', 'StorageClass', 'ETag',
-            'IsMultipartUploaded', 'ReplicationStatus', 'EncryptionStatus']}})
+            'IsMultipartUploaded', 'ReplicationStatus', 'EncryptionStatus',
+            'ObjectLockRetainUntilDate', 'ObjectLockMode', 'ObjectLockLegalHoldStatus',
+            'IntelligentTieringAccessTier']}})
 
     permissions = ('s3:PutInventoryConfiguration', 's3:GetInventoryConfiguration')
 
@@ -2366,6 +2722,7 @@ class SetInventory(BucketActionBase):
         versions = self.data.get('versions', 'Current')
         state = self.data.get('state', 'enabled')
         encryption = self.data.get('encryption')
+        inventory_format = self.data.get('format', 'CSV')
 
         if not prefix:
             prefix = "Inventories/%s" % (self.manager.config.account_id)
@@ -2382,7 +2739,7 @@ class SetInventory(BucketActionBase):
 
         bucket = {
             'Bucket': "arn:aws:s3:::%s" % destination,
-            'Format': 'CSV'
+            'Format': inventory_format
         }
 
         inventory = {
@@ -2546,7 +2903,7 @@ class DeleteBucket(ScanBucket):
         log.info(
             "EmptyBucket buckets:%d Complete keys:%d rate:%0.2f/s time:%0.2fs",
             len(buckets), object_count,
-            float(object_count) / run_time, run_time)
+            float(object_count) / run_time if run_time else 0, run_time)
         return results
 
     def process_chunk(self, batch, bucket):
@@ -2567,7 +2924,8 @@ class DeleteBucket(ScanBucket):
 class Lifecycle(BucketActionBase):
     """Action applies a lifecycle policy to versioned S3 buckets
 
-    The schema to supply to the rule follows the schema here: goo.gl/yULzNc
+    The schema to supply to the rule follows the schema here:
+     https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.put_bucket_lifecycle_configuration
 
     To delete a lifecycle rule, supply Status=absent
 
@@ -2595,7 +2953,6 @@ class Lifecycle(BucketActionBase):
         **{
             'rules': {
                 'type': 'array',
-                'required': True,
                 'items': {
                     'type': 'object',
                     'required': ['ID', 'Status'],
@@ -2750,7 +3107,7 @@ class Lifecycle(BucketActionBase):
                 raise e
 
 
-class KMSKeyResolverMixin(object):
+class KMSKeyResolverMixin:
     """Builds a dictionary of region specific ARNs"""
 
     def __init__(self, data, manager=None):
@@ -2803,7 +3160,7 @@ class BucketEncryption(KMSKeyResolverMixin, Filter):
               - name: s3-bucket-encryption-KMS
                 resource: s3
                 region: us-east-1
-                filters
+                filters:
                   - type: bucket-encryption
                     state: True
                     crypto: aws:kms
@@ -2811,7 +3168,7 @@ class BucketEncryption(KMSKeyResolverMixin, Filter):
               - name: s3-bucket-encryption-off
                 resource: s3
                 region: us-east-1
-                filters
+                filters:
                   - type: bucket-encryption
                     state: False
     """
@@ -2820,7 +3177,8 @@ class BucketEncryption(KMSKeyResolverMixin, Filter):
                          crypto={'type': 'string', 'enum': ['AES256', 'aws:kms']},
                          key={'type': 'string'})
 
-    permissions = ('s3:GetBucketEncryption', 's3:DescribeKey')
+    permissions = ('s3:GetEncryptionConfiguration', 'kms:DescribeKey')
+    annotation_key = 'c7n:bucket-encryption'
 
     def process(self, buckets, event=None):
         self.resolve_keys(buckets)
@@ -2838,16 +3196,22 @@ class BucketEncryption(KMSKeyResolverMixin, Filter):
         return results
 
     def process_bucket(self, b):
+
         client = bucket_client(local_session(self.manager.session_factory), b)
         rules = []
-        try:
-            be = client.get_bucket_encryption(Bucket=b['Name'])
-            b['c7n:bucket-encryption'] = be
-            rules = be.get('ServerSideEncryptionConfiguration', []).get('Rules', [])
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'ServerSideEncryptionConfigurationNotFoundError':
-                raise
+        if self.annotation_key not in b:
+            try:
+                be = client.get_bucket_encryption(Bucket=b['Name'])
+                be.pop('ResponseMetadata', None)
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'ServerSideEncryptionConfigurationNotFoundError':
+                    raise
+                be = {}
+            b[self.annotation_key] = be
+        else:
+            be = [self.annotation_key]
 
+        rules = be.get('ServerSideEncryptionConfiguration', {}).get('Rules', [])
         # default `state` to True as previous impl assumed state == True
         # to preserve backwards compatibility
         if self.data.get('state', True):
@@ -2944,7 +3308,7 @@ class SetBucketEncryption(KMSKeyResolverMixin, BucketActionBase):
     }
 
     permissions = ('s3:PutEncryptionConfiguration', 's3:GetEncryptionConfiguration',
-                   'kms:ListAliases', 's3:DescribeKey')
+                   'kms:ListAliases', 'kms:DescribeKey')
 
     def process(self, buckets):
         if self.data.get('enabled', True):

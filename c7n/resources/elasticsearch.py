@@ -11,77 +11,68 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import functools
-import logging
-import itertools
+import jmespath
 
 from c7n.actions import Action, ModifyVpcSecurityGroupsAction
-from c7n.filters import MetricsFilter, FilterRegistry
-from c7n.filters.vpc import SecurityGroupFilter, SubnetFilter
+from c7n.filters import MetricsFilter
+from c7n.filters.vpc import SecurityGroupFilter, SubnetFilter, VpcFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
-from c7n.utils import (
-    chunks, local_session, get_retry, type_schema, generate_arn)
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
+from c7n.utils import chunks, local_session, type_schema
 from c7n.tags import Tag, RemoveTag, TagActionFilter, TagDelayedAction
 
-log = logging.getLogger('custodian.es')
-filters = FilterRegistry('es.filters')
-filters.register('marked-for-op', TagActionFilter)
+from .securityhub import PostFinding
+
+
+class DescribeDomain(DescribeSource):
+
+    def get_resources(self, resource_ids):
+        client = local_session(self.manager.session_factory).client('es')
+        return client.describe_elasticsearch_domains(
+            DomainNames=resource_ids)['DomainStatusList']
+
+    def augment(self, domains):
+        client = local_session(self.manager.session_factory).client('es')
+        model = self.manager.get_model()
+        results = []
+
+        def _augment(resource_set):
+            resources = self.manager.retry(
+                client.describe_elasticsearch_domains,
+                DomainNames=resource_set)['DomainStatusList']
+            for r in resources:
+                rarn = self.manager.generate_arn(r[model.id])
+                r['Tags'] = self.manager.retry(
+                    client.list_tags, ARN=rarn).get('TagList', [])
+            return resources
+
+        for resource_set in chunks(domains, 5):
+            results.extend(_augment(resource_set))
+
+        return results
 
 
 @resources.register('elasticsearch')
 class ElasticSearchDomain(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'es'
-        type = "elasticsearch"
+        arn = 'ARN'
+        arn_type = 'domain'
         enum_spec = (
             'list_domain_names', 'DomainNames[].DomainName', None)
         id = 'DomainName'
         name = 'Name'
         dimension = "DomainName"
-        filter_name = None
+        cfn_type = config_type = 'AWS::Elasticsearch::Domain'
 
-    filter_registry = filters
-    _generate_arn = _account_id = None
-    retry = staticmethod(get_retry(('Throttled',)))
+    source_mapping = {
+        'describe': DescribeDomain,
+        'config': ConfigSource
+    }
 
-    @property
-    def generate_arn(self):
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn,
-                'es',
-                region=self.config.region,
-                account_id=self.config.account_id,
-                resource_type='domain',
-                separator='/')
-        return self._generate_arn
 
-    def get_resources(self, resource_ids):
-        client = local_session(self.session_factory).client('es')
-        return client.describe_elasticsearch_domains(
-            DomainNames=resource_ids)['DomainStatusList']
-
-    def augment(self, domains):
-        client = local_session(self.session_factory).client('es')
-        model = self.get_model()
-
-        def _augment(resource_set):
-            resources = self.retry(
-                client.describe_elasticsearch_domains,
-                DomainNames=resource_set)['DomainStatusList']
-            for r in resources:
-                rarn = self.generate_arn(r[model.id])
-                r['Tags'] = self.retry(
-                    client.list_tags, ARN=rarn).get('TagList', [])
-            return resources
-
-        with self.executor_factory(max_workers=1) as w:
-            return list(itertools.chain(
-                *w.map(_augment, chunks(domains, 5))))
+ElasticSearchDomain.filter_registry.register('marked-for-op', TagActionFilter)
 
 
 @ElasticSearchDomain.filter_registry.register('subnet')
@@ -96,6 +87,12 @@ class SecurityGroup(SecurityGroupFilter):
     RelatedIdsExpression = "VPCOptions.SecurityGroupIds[]"
 
 
+@ElasticSearchDomain.filter_registry.register('vpc')
+class Vpc(VpcFilter):
+
+    RelatedIdsExpression = "VPCOptions.VPCId"
+
+
 @ElasticSearchDomain.filter_registry.register('metrics')
 class Metrics(MetricsFilter):
 
@@ -104,6 +101,48 @@ class Metrics(MetricsFilter):
                  'Value': self.manager.account_id},
                 {'Name': 'DomainName',
                  'Value': resource['DomainName']}]
+
+
+@ElasticSearchDomain.action_registry.register('post-finding')
+class ElasticSearchPostFinding(PostFinding):
+
+    resource_type = 'AwsElasticsearchDomain'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(self.filter_empty({
+            'AccessPolicies': r.get('AccessPolicies'),
+            'DomainId': r['DomainId'],
+            'DomainName': r['DomainName'],
+            'Endpoint': r.get('Endpoint'),
+            'Endpoints': r.get('Endpoints'),
+            'DomainEndpointOptions': self.filter_empty({
+                'EnforceHTTPS': jmespath.search(
+                    'DomainEndpointOptions.EnforceHTTPS', r),
+                'TLSSecurityPolicy': jmespath.search(
+                    'DomainEndpointOptions.TLSSecurityPolicy', r)
+            }),
+            'ElasticsearchVersion': r['ElasticsearchVersion'],
+            'EncryptionAtRestOptions': self.filter_empty({
+                'Enabled': jmespath.search(
+                    'EncryptionAtRestOptions.Enabled', r),
+                'KmsKeyId': jmespath.search(
+                    'EncryptionAtRestOptions.KmsKeyId', r)
+            }),
+            'NodeToNodeEncryptionOptions': self.filter_empty({
+                'Enabled': jmespath.search(
+                    'NodeToNodeEncryptionOptions.Enabled', r)
+            }),
+            'VPCOptions': self.filter_empty({
+                'AvailabilityZones': jmespath.search(
+                    'VPCOptions.AvailabilityZones', r),
+                'SecurityGroupIds': jmespath.search(
+                    'VPCOptions.SecurityGroupIds', r),
+                'SubnetIds': jmespath.search('VPCOptions.SubnetIds', r),
+                'VPCId': jmespath.search('VPCOptions.VPCId', r)
+            })
+        }))
+        return envelope
 
 
 @ElasticSearchDomain.action_registry.register('modify-security-groups')
@@ -127,7 +166,7 @@ class ElasticSearchModifySG(ModifyVpcSecurityGroupsAction):
 class Delete(Action):
 
     schema = type_schema('delete')
-    permissions = ('es:DeleteElastisearchDomain',)
+    permissions = ('es:DeleteElasticsearchDomain',)
 
     def process(self, resources):
         client = local_session(self.manager.session_factory).client('es')
@@ -155,18 +194,11 @@ class ElasticSearchAddTag(Tag):
     """
     permissions = ('es:AddTags',)
 
-    def process_resource_set(self, domains, tags):
-        client = local_session(self.manager.session_factory).client('es')
-        tag_list = []
-        for t in tags:
-            tag_list.append({'Key': t['Key'], 'Value': t['Value']})
+    def process_resource_set(self, client, domains, tags):
         for d in domains:
             try:
-                client.add_tags(ARN=d['ARN'], TagList=tag_list)
-            except Exception as e:
-                self.log.exception(
-                    'Exception tagging es domain %s: %s',
-                    d['DomainName'], e)
+                client.add_tags(ARN=d['ARN'], TagList=tags)
+            except client.exceptions.ResourceNotFoundExecption:
                 continue
 
 
@@ -189,15 +221,11 @@ class ElasticSearchRemoveTag(RemoveTag):
         """
     permissions = ('es:RemoveTags',)
 
-    def process_resource_set(self, domains, tags):
-        client = local_session(self.manager.session_factory).client('es')
+    def process_resource_set(self, client, domains, tags):
         for d in domains:
             try:
                 client.remove_tags(ARN=d['ARN'], TagKeys=tags)
-            except Exception as e:
-                self.log.exception(
-                    'Exception while removing tags from queue %s: %s',
-                    d['DomainName'], e)
+            except client.exceptions.ResourceNotFoundExecption:
                 continue
 
 
@@ -220,18 +248,3 @@ class ElasticSearchMarkForOp(TagDelayedAction):
                         op: delete
                         tag: c7n_es_delete
     """
-    permissions = ('es:AddTags',)
-
-    def process_resource_set(self, domains, tags):
-        client = local_session(self.manager.session_factory).client('es')
-        tag_list = []
-        for t in tags:
-            tag_list.append({'Key': t['Key'], 'Value': t['Value']})
-        for d in domains:
-            try:
-                client.add_tags(ARN=d['ARN'], TagList=tag_list)
-            except Exception as e:
-                self.log.exception(
-                    'Exception tagging es domain %s: %s',
-                    d['DomainName'], e)
-                continue

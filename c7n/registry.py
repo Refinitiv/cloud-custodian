@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
 
 
-class PluginRegistry(object):
+class PluginRegistry:
     """A plugin registry
 
     Custodian is intended to be innately pluggable both internally and
@@ -52,22 +51,21 @@ class PluginRegistry(object):
     def __init__(self, plugin_type):
         self.plugin_type = plugin_type
         self._factories = {}
-        self._subscribers = {x: [] for x in self.EVENTS}
+        self._subscribers = []
 
-    def subscribe(self, event, func):
-        if event not in self.EVENTS:
-            raise ValueError('Invalid event')
-        self._subscribers[event].append(func)
+    def subscribe(self, func):
+        self._subscribers.append(func)
 
     def register(self, name, klass=None, condition=True,
-                 condition_message="Missing dependency for {}"):
+                 condition_message="Missing dependency for {}",
+                 aliases=None):
         if not condition and klass:
             return klass
         # invoked as function
         if klass:
             klass.type = name
+            klass.type_aliases = aliases
             self._factories[name] = klass
-            self.notify(self.EVENT_REGISTER, klass)
             return klass
 
         # invoked as class decorator
@@ -76,7 +74,7 @@ class PluginRegistry(object):
                 return klass
             self._factories[name] = klass
             klass.type = name
-            self.notify(self.EVENT_REGISTER, klass)
+            klass.type_aliases = aliases
             return klass
         return _register_class
 
@@ -84,35 +82,37 @@ class PluginRegistry(object):
         if name in self._factories:
             del self._factories[name]
 
-    def notify(self, event, key=None):
-        for subscriber in self._subscribers[event]:
+    def notify(self, key=None):
+        for subscriber in self._subscribers:
             subscriber(self, key)
 
     def __contains__(self, key):
         return key in self._factories
 
     def __getitem__(self, name):
-        return self.get(name)
+        v = self.get(name)
+        if v is None:
+            raise KeyError(name)
+        return v
+
+    def __len__(self):
+        return len(self._factories)
 
     def get(self, name):
-        return self._factories.get(name)
+        factory = self._factories.get(name)
+
+        if factory:
+            return factory
+
+        return next((v for k, v in self._factories.items()
+                     if v.type_aliases and name in v.type_aliases),
+                    None)
 
     def keys(self):
         return self._factories.keys()
 
+    def values(self):
+        return self._factories.values()
+
     def items(self):
         return self._factories.items()
-
-    def load_plugins(self):
-        """ Load external plugins.
-
-        Custodian is intended to interact with internal and external systems
-        that are not suitable for embedding into the custodian code base.
-        """
-        try:
-            from pkg_resources import iter_entry_points
-        except ImportError:
-            return
-        for ep in iter_entry_points(group="custodian.%s" % self.plugin_type):
-            f = ep.load()
-            f()

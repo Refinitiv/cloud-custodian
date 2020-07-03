@@ -17,13 +17,12 @@ import copy
 import os
 import unittest
 
-import six
 from c7n_mailer.email_delivery import EmailDelivery
 from common import logger, get_ldap_lookup
-from common import MAILER_CONFIG, RESOURCE_1, SQS_MESSAGE_1
-from mock import patch, call
+from common import MAILER_CONFIG, RESOURCE_1, SQS_MESSAGE_1, SQS_MESSAGE_4
+from mock import patch, call, MagicMock
 
-from c7n_mailer.utils_email import is_email
+from c7n_mailer.utils_email import is_email, priority_header_is_valid, get_mimetext_message
 
 # note principalId is very org/domain specific for federated?, it would be good to get
 # confirmation from capone on this event / test.
@@ -54,7 +53,12 @@ class EmailTest(unittest.TestCase):
         self.email_delivery.ldap_lookup.uid_regex = ''
         template_abs_filename = os.path.join(os.path.abspath(os.path.dirname(__file__)),
                                              'example.jinja')
+
+        # Jinja paths must always be forward slashes regardless of operating system
+        template_abs_filename = template_abs_filename.replace('\\', '/')
+
         SQS_MESSAGE_1['action']['template'] = template_abs_filename
+        SQS_MESSAGE_4['action']['template'] = template_abs_filename
 
     def test_valid_email(self):
         self.assertFalse(is_email('foobar'))
@@ -62,13 +66,30 @@ class EmailTest(unittest.TestCase):
         self.assertFalse(is_email('slack://foo@bar.com'))
         self.assertTrue(is_email('foo@bar.com'))
 
+    def test_smtp_creds(self):
+        conf = dict(MAILER_CONFIG)
+        conf['smtp_username'] = 'alice'
+        conf['smtp_password'] = 'bob'
+
+        msg = dict(SQS_MESSAGE_1)
+        deliver = MockEmailDelivery(conf, self.aws_session, logger)
+        messages_map = deliver.get_to_addrs_email_messages_map(msg)
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            with patch('c7n_mailer.utils.kms_decrypt') as mock_decrypt:
+                mock_decrypt.return_value = 'xyz'
+                for email_addrs, mimetext_msg in messages_map.items():
+                    deliver.send_c7n_email(msg, list(email_addrs), mimetext_msg)
+            mock_decrypt.assert_called_once()
+            mock_smtp.assert_has_calls([call().login('alice', 'xyz')])
+
     def test_priority_header_is_valid(self):
-        self.assertFalse(self.email_delivery.priority_header_is_valid('0'))
-        self.assertFalse(self.email_delivery.priority_header_is_valid('-1'))
-        self.assertFalse(self.email_delivery.priority_header_is_valid('6'))
-        self.assertFalse(self.email_delivery.priority_header_is_valid('sd'))
-        self.assertTrue(self.email_delivery.priority_header_is_valid('1'))
-        self.assertTrue(self.email_delivery.priority_header_is_valid('5'))
+        self.assertFalse(priority_header_is_valid('0', self.email_delivery.logger))
+        self.assertFalse(priority_header_is_valid('-1', self.email_delivery.logger))
+        self.assertFalse(priority_header_is_valid('6', self.email_delivery.logger))
+        self.assertFalse(priority_header_is_valid('sd', self.email_delivery.logger))
+        self.assertTrue(priority_header_is_valid('1', self.email_delivery.logger))
+        self.assertTrue(priority_header_is_valid('5', self.email_delivery.logger))
 
     def test_get_valid_emails_from_list(self):
         list_1 = [
@@ -83,8 +104,6 @@ class EmailTest(unittest.TestCase):
 
     def test_event_owner_ldap_flow(self):
         targets = ['event-owner']
-        username = self.email_delivery.get_aws_username_from_event(CLOUDTRAIL_EVENT)
-        self.assertEqual(username, 'michael_bolton')
         michael_bolton_email = self.email_delivery.get_event_owner_email(targets, CLOUDTRAIL_EVENT)
         self.assertEqual(michael_bolton_email, ['michael_bolton@initech.com'])
 
@@ -128,7 +147,7 @@ class EmailTest(unittest.TestCase):
             SQS_MESSAGE
         )
         with patch("smtplib.SMTP") as mock_smtp:
-            for email_addrs, mimetext_msg in six.iteritems(to_addrs_to_email_messages_map):
+            for email_addrs, mimetext_msg in to_addrs_to_email_messages_map.items():
                 self.email_delivery.send_c7n_email(SQS_MESSAGE, list(email_addrs), mimetext_msg)
 
                 self.assertEqual(mimetext_msg['X-Priority'], '1 (Highest)')
@@ -165,7 +184,7 @@ class EmailTest(unittest.TestCase):
             SQS_MESSAGE
         )
         with patch("smtplib.SMTP") as mock_smtp:
-            for email_addrs, mimetext_msg in six.iteritems(to_addrs_to_email_messages_map):
+            for email_addrs, mimetext_msg in to_addrs_to_email_messages_map.items():
                 self.email_delivery.send_c7n_email(SQS_MESSAGE, list(email_addrs), mimetext_msg)
                 self.assertEqual(mimetext_msg.get('X-Priority'), None)
                 # self.assertEqual(mimetext_msg.get('X-Priority'), None)
@@ -271,3 +290,69 @@ class EmailTest(unittest.TestCase):
         )
 
         self.assertEqual(ldap_emails, ['milton@initech.com'])
+
+    def test_get_resource_owner_emails_from_resource_org_domain_not_invoked(self):
+        config = copy.deepcopy(MAILER_CONFIG)
+        logger_mock = MagicMock()
+
+        # Enable org_domain
+        config['org_domain'] = "test.com"
+
+        # Add "CreatorName" to contact tags to avoid creating a new
+        # resource.
+        config['contact_tags'].append('CreatorName')
+
+        self.email_delivery = MockEmailDelivery(config, self.aws_session, logger_mock)
+        org_emails = self.email_delivery.get_resource_owner_emails_from_resource(
+            SQS_MESSAGE_1,
+            RESOURCE_1
+        )
+
+        assert org_emails == ['milton@initech.com', 'peter@initech.com']
+        assert call("Using org_domain to reconstruct email addresses from contact_tags values") \
+            not in logger_mock.debug.call_args_list
+
+    def test_get_resource_owner_emails_from_resource_org_domain(self):
+        config = copy.deepcopy(MAILER_CONFIG)
+        logger_mock = MagicMock()
+
+        # Enable org_domain and disable ldap lookups
+        # If ldap lookups are enabled, org_domain logic is not invoked.
+        config['org_domain'] = "test.com"
+        del config['ldap_uri']
+
+        # Add "CreatorName" to contact tags to avoid creating a new
+        # resource.
+        config['contact_tags'].append('CreatorName')
+
+        self.email_delivery = MockEmailDelivery(config, self.aws_session, logger_mock)
+        org_emails = self.email_delivery.get_resource_owner_emails_from_resource(
+            SQS_MESSAGE_1,
+            RESOURCE_1
+        )
+
+        assert org_emails == ['milton@initech.com', 'peter@test.com']
+        logger_mock.debug.assert_called_with(
+            "Using org_domain to reconstruct email addresses from contact_tags values")
+
+    def test_cc_email_functionality(self):
+        email = get_mimetext_message(
+            self.email_delivery.config, self.email_delivery.logger,
+            SQS_MESSAGE_4, SQS_MESSAGE_4['resources'], ['hello@example.com'])
+        self.assertEqual(email['Cc'], 'hello@example.com, cc@example.com')
+
+    def test_sendgrid(self):
+        config = copy.deepcopy(MAILER_CONFIG)
+        logger_mock = MagicMock()
+
+        config['sendgrid_api_key'] = 'SENDGRID_API_KEY'
+        del config['smtp_server']
+
+        delivery = MockEmailDelivery(config, self.aws_session, logger_mock)
+
+        with patch("sendgrid.SendGridAPIClient.send") as mock_send:
+            with patch('c7n_mailer.utils.kms_decrypt') as mock_decrypt:
+                mock_decrypt.return_value = 'xyz'
+                delivery.send_c7n_email(SQS_MESSAGE_1, None, None)
+                mock_decrypt.assert_called_once()
+            mock_send.assert_called()

@@ -20,7 +20,9 @@ import zlib
 from .core import EventAction
 from c7n import utils
 from c7n.exceptions import PolicyValidationError
+from c7n.manager import resources as aws_resources
 from c7n.resolver import ValuesFrom
+from c7n.version import version
 
 
 class BaseNotify(EventAction):
@@ -66,50 +68,51 @@ class Notify(BaseNotify):
     transport, with the exception of the ``mtype`` attribute, which is a
     reserved attribute used by Cloud Custodian.
 
-    Example::
+    :example:
 
-      policies:
-        - name: ec2-bad-instance-kill
-          resource: ec2
-          filters:
-           - Name: bad-instance
-          actions:
-           - terminate
-           - type: notify
-             to:
-              - event-user
-              - resource-creator
-              - email@address
-             owner_absent_contact:
-              - other_email@address
-             # which template for the email should we use
-             template: policy-template
-             transport:
-               type: sqs
-               region: us-east-1
-               queue: xyz
+    .. code-block:: yaml
 
-        - name: ec2-notify-with-attributes
-          resource: ec2
-          filters:
-           - Name: bad-instance
-          actions:
-           - type: notify
-             to:
-              - event-user
-              - resource-creator
-              - email@address
-             owner_absent_contact:
-              - other_email@address
-             # which template for the email should we use
-             template: policy-template
-             transport:
-               type: sns
-               region: us-east-1
-               topic: your-notify-topic
-               attributes:
-                 - attribute_key: attribute_value
-                 - attribute_key_2: attribute_value_2
+              policies:
+                - name: ec2-bad-instance-kill
+                  resource: ec2
+                  filters:
+                   - Name: bad-instance
+                  actions:
+                   - terminate
+                   - type: notify
+                     to:
+                      - event-user
+                      - resource-creator
+                      - email@address
+                     owner_absent_contact:
+                      - other_email@address
+                     # which template for the email should we use
+                     template: policy-template
+                     transport:
+                       type: sqs
+                       region: us-east-1
+                       queue: xyz
+                - name: ec2-notify-with-attributes
+                  resource: ec2
+                  filters:
+                   - Name: bad-instance
+                  actions:
+                   - type: notify
+                     to:
+                      - event-user
+                      - resource-creator
+                      - email@address
+                     owner_absent_contact:
+                      - other_email@address
+                     # which template for the email should we use
+                     template: policy-template
+                     transport:
+                       type: sns
+                       region: us-east-1
+                       topic: your-notify-topic
+                       attributes:
+                          attribute_key: attribute_value
+                          attribute_key_2: attribute_value_2
     """
 
     C7N_DATA_MESSAGE = "maidmsg/1.0"
@@ -158,8 +161,8 @@ class Notify(BaseNotify):
         if self.data.get('transport', {}).get('type') == 'sns' and \
                 self.data.get('transport').get('attributes') and \
                 'mtype' in self.data.get('transport').get('attributes').keys():
-                    raise PolicyValidationError(
-                        "attribute: mtype is a reserved attribute for sns transport")
+            raise PolicyValidationError(
+                "attribute: mtype is a reserved attribute for sns transport")
         return self
 
     def get_permissions(self):
@@ -176,7 +179,10 @@ class Notify(BaseNotify):
             'event': event,
             'account_id': self.manager.config.account_id,
             'account': alias,
+            'version': version,
             'region': self.manager.config.region,
+            'execution_id': self.manager.ctx.execution_id,
+            'execution_start': self.manager.ctx.start_time,
             'policy': self.manager.data}
         message['action'] = self.expand_variables(message)
 
@@ -232,13 +238,15 @@ class Notify(BaseNotify):
     def send_sns(self, message):
         topic = self.data['transport']['topic'].format(**message)
         user_attributes = self.data['transport'].get('attributes')
-        if topic.startswith('arn:aws:sns'):
+        if topic.startswith('arn:'):
             region = region = topic.split(':', 5)[3]
             topic_arn = topic
         else:
             region = message['region']
-            topic_arn = "arn:aws:sns:%s:%s:%s" % (
-                message['region'], message['account_id'], topic)
+            topic_arn = utils.generate_arn(
+                service='sns', resource=topic,
+                account_id=message['account_id'],
+                region=message['region'])
         client = self.manager.session_factory(
             region=region, assume=self.assume_role).client('sns')
         attrs = {
@@ -268,7 +276,7 @@ class Notify(BaseNotify):
         elif queue.startswith('https://sqs.'):
             region = queue.split('.', 2)[1]
             queue_url = queue
-        elif queue.startswith('arn:aws:sqs'):
+        elif queue.startswith('arn:'):
             queue_arn_split = queue.split(':', 5)
             region = queue_arn_split[3]
             owner_id = queue_arn_split[4]
@@ -294,3 +302,13 @@ class Notify(BaseNotify):
             MessageBody=self.pack(message),
             MessageAttributes=attrs)
         return result['MessageId']
+
+    @classmethod
+    def register_resource(cls, registry, resource_class):
+        if 'notify' in resource_class.action_registry:
+            return
+
+        resource_class.action_registry.register('notify', cls)
+
+
+aws_resources.subscribe(Notify.register_resource)

@@ -16,10 +16,10 @@ import time
 
 from datadog import api
 from datadog import initialize
-from six.moves.urllib.parse import urlparse, parse_qsl
+from urllib.parse import urlparse, parse_qsl
 
 
-class DataDogDelivery(object):
+class DataDogDelivery:
     DATADOG_API_KEY = 'datadog_api_key'
     DATADOG_APPLICATION_KEY = 'datadog_application_key'
 

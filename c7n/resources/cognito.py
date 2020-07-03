@@ -11,28 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
 
 from c7n.actions import BaseAction
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 
 
 @resources.register('identity-pool')
 class CognitoIdentityPool(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'cognito-identity'
         enum_spec = ('list_identity_pools', 'IdentityPools', {'MaxResults': 60})
         detail_spec = (
             'describe_identity_pool', 'IdentityPoolId', 'IdentityPoolId', None)
         id = 'IdentityPoolId'
         name = 'IdentityPoolName'
-        filter_name = None
-        dimension = None
+        arn_type = "identitypool"
+        cfn_type = 'AWS::Cognito::IdentityPool'
 
 
 @CognitoIdentityPool.action_registry.register('delete')
@@ -72,15 +70,15 @@ class DeleteIdentityPool(BaseAction):
 @resources.register('user-pool')
 class CognitoUserPool(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "cognito-idp"
         enum_spec = ('list_user_pools', 'UserPools', {'MaxResults': 60})
         detail_spec = (
             'describe_user_pool', 'UserPoolId', 'Id', 'UserPool')
         id = 'Id'
         name = 'Name'
-        filter_name = None
-        dimension = None
+        arn_type = "userpool"
+        cfn_type = 'AWS::Cognito::UserPool'
 
 
 @CognitoUserPool.action_registry.register('delete')

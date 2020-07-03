@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import json
+from mock import patch
 
 from botocore.exceptions import ClientError
-from .common import BaseTest, functional, TestConfig as Config
+from .common import BaseTest, functional
 from c7n.executor import MainThreadExecutor
+from c7n.resources.aws import shape_validate
 from c7n.resources.awslambda import AWSLambda, ReservedConcurrency
 from c7n.mu import PythonPackageArchive
 
@@ -117,7 +117,61 @@ class LambdaPermissionTest(BaseTest):
         self.assertRaises(ClientError, client.get_policy, FunctionName=name)
 
 
+class LambdaLayerTest(BaseTest):
+
+    def test_lambda_layer_cross_account(self):
+        factory = self.replay_flight_data('test_lambda_layer_cross_account')
+        p = self.load_policy({
+            'name': 'lambda-layer-cross',
+            'resource': 'lambda-layer',
+            'filters': [{'type': 'cross-account'}],
+            'actions': [{'type': 'remove-statements',
+                         'statement_ids': 'matched'}]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertTrue('CrossAccountViolations' in resources[0].keys())
+        client = factory().client('lambda')
+        with self.assertRaises(client.exceptions.ResourceNotFoundException):
+            client.get_layer_version_policy(
+                LayerName=resources[0]['LayerName'],
+                VersionNumber=resources[0]['Version']).get('Policy')
+
+    def test_delete_layer(self):
+        factory = self.replay_flight_data('test_lambda_layer_delete')
+        p = self.load_policy({
+            'name': 'lambda-layer-delete',
+            'resource': 'lambda-layer',
+            'filters': [{'LayerName': 'test'}],
+            'actions': [{'type': 'delete'}]},
+            session_factory=factory)
+        resources = p.run()
+        client = factory().client('lambda')
+        with self.assertRaises(client.exceptions.ResourceNotFoundException):
+            client.get_layer_version(
+                LayerName='test',
+                VersionNumber=resources[0]['Version'])
+
+
 class LambdaTest(BaseTest):
+
+    def test_lambda_check_permission(self):
+        # lots of pre-conditions, iam role with iam read only policy attached
+        # and a permission boundary with deny on iam read access.
+        factory = self.replay_flight_data('test_lambda_check_permission')
+        p = self.load_policy(
+            {
+                'name': 'lambda-check',
+                'resource': 'lambda',
+                'filters': [
+                    {'FunctionName': 'custodian-log-age'},
+                    {'type': 'check-permissions',
+                     'match': 'allowed',
+                     'actions': ['iam:ListUsers']}]
+            },
+            session_factory=factory)
+        resources = p.run()
+        assert not resources
 
     def test_lambda_config_source(self):
         factory = self.replay_flight_data("test_aws_lambda_config_source")
@@ -126,16 +180,61 @@ class LambdaTest(BaseTest):
                 "name": "lambda-config",
                 "resource": "lambda",
                 "source": "config",
-                "filters": [{"FunctionName": "omnissm-register"}],
+                'query': [
+                    {'clause': "resourceId = 'omnissm-handle-registrations'"},
+                ],
             },
-            session_factory=factory,
-        )
+            session_factory=factory, config={'region': 'us-east-2'})
+
         resources = p.run()
         self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]['FunctionName'], 'omnissm-handle-registrations')
         self.assertEqual(
             resources[0]["Tags"], [{"Key": "lambda:createdBy", "Value": "SAM"}]
         )
         self.assertTrue("c7n:Policy" in resources[0])
+
+    def test_post_finding(self):
+        factory = self.replay_flight_data('test_lambda_post_finding')
+        p = self.load_policy({
+            'name': 'lambda',
+            'resource': 'aws.lambda',
+            'actions': [
+                {'type': 'post-finding',
+                 'types': [
+                     'Software and Configuration Checks/OrgStandard/abc-123']}]},
+            session_factory=factory, config={'region': 'us-west-2'})
+        functions = p.resource_manager.get_resources([
+            'custodian-ec2-ssm-query'])
+        rfinding = p.resource_manager.actions[0].format_resource(functions[0])
+        self.maxDiff = None
+        self.assertEqual(
+            rfinding,
+            {'Details': {'AwsLambdaFunction': {
+                'CodeSha256': 'Pq32lM46RbVovW/Abh14XfrFHIeUM/cAEC51fwkf+tk=',
+                'Code': {
+                    'S3Bucket': 'awslambda-us-west-2-tasks',
+                    'S3Key': 'snapshots/644160558196/custodian-ec2-ssm-query-c3bed681-aa99-4bb2-a155-2f5897de20d2',  # noqa
+                    'S3ObjectVersion': 'Nupr9wOmyG9eZbta8NGFUV9lslQ5NI7m'},
+                'Handler': 'custodian_policy.run',
+                'LastModified': '2019-07-29T22:37:20.844+0000',
+                'MemorySize': 512,
+                'RevisionId': '8bbaf510-0ae1-40a5-8980-084bebd3f9c6',
+                'Role': 'arn:aws:iam::644160558196:role/CloudCustodianRole',
+                'Runtime': 'python3.7',
+                'Timeout': 900,
+                'TracingConfig': {'Mode': 'PassThrough'},
+                'Version': '$LATEST',
+                'VpcConfig': {'SecurityGroupIds': [],
+                              'SubnetIds': []}}},
+             'Id': 'arn:aws:lambda:us-west-2:644160558196:function:custodian-ec2-ssm-query',
+             'Partition': 'aws',
+             'Region': 'us-west-2',
+             'Tags': {'custodian-info': 'mode=config-rule:version=0.8.44.2'},
+             'Type': 'AwsLambdaFunction'})
+        shape_validate(
+            rfinding['Details']['AwsLambdaFunction'],
+            'AwsLambdaFunctionDetails', 'securityhub')
 
     def test_delete(self):
         factory = self.replay_flight_data("test_aws_lambda_delete")
@@ -244,7 +343,7 @@ class LambdaTest(BaseTest):
         resources = p.run()
         self.assertEqual(len(resources), 2)
         self.assertEqual(
-            {r["c7n:EventSources"][0] for r in resources}, set(["iot.amazonaws.com"])
+            {r["c7n:EventSources"][0] for r in resources}, {"iot.amazonaws.com"}
         )
 
     def test_sg_filter(self):
@@ -277,48 +376,29 @@ class LambdaTagTest(BaseTest):
             {
                 "name": "lambda-tag",
                 "resource": "lambda",
-                "filters": [{"FunctionName": "CloudCustodian"}],
-                "actions": [{"type": "tag", "key": "xyz", "value": "abcdef"}],
+                "filters": [
+                    {"FunctionName": "CloudCustodian"},
+                    {"tag:Env": "Dev"},
+                ],
+                "actions": [
+                    {"type": "tag", "key": "xyz", "value": "abcdef"},
+                    {"type": "remove-tag", "tags": ["Env"]}
+                ]
             },
-            session_factory=session_factory,
-        )
+            session_factory=session_factory, config={
+                'account_id': '644160558196',
+                'region': 'us-west-2'})
 
         resources = policy.run()
         self.assertEqual(len(resources), 1)
         arn = resources[0]["FunctionArn"]
-        tags = client.list_tags(Resource=arn)["Tags"]
-        self.assertTrue("xyz" in tags.keys())
 
-        policy = self.load_policy(
-            {
-                "name": "lambda-tag",
-                "resource": "lambda",
-                "filters": [{"FunctionName": "CloudCustodian"}],
-                "actions": [{"type": "remove-tag", "tags": ["xyz"]}],
-            },
-            session_factory=session_factory,
-        )
-        resources = policy.run()
-        self.assertEqual(len(resources), 1)
-        arn = resources[0]["FunctionArn"]
-        tags = client.list_tags(Resource=arn)["Tags"]
-        self.assertFalse("xyz" in tags.keys())
+        after_tags = client.list_tags(Resource=arn)["Tags"]
+        before_tags = {
+            t['Key']: t['Value'] for t in resources[0]['Tags']}
 
-    def test_lambda_tags(self):
-        self.patch(AWSLambda, "executor_factory", MainThreadExecutor)
-        session_factory = self.replay_flight_data("test_lambda_tags")
-        policy = self.load_policy(
-            {
-                "name": "lambda-mark",
-                "resource": "lambda",
-                "filters": [{"tag:Language": "Python"}],
-            },
-            config=Config.empty(),
-            session_factory=session_factory,
-        )
-        resources = policy.run()
-        self.assertEqual(len(resources), 1)
-        self.assertEqual(resources[0]["FunctionName"], "CloudCustodian")
+        self.assertEqual(before_tags, {'Env': 'Dev'})
+        self.assertEqual(after_tags, {'xyz': 'abcdef'})
 
     def test_mark_and_match(self):
         session_factory = self.replay_flight_data("test_lambda_mark_and_match")
@@ -337,25 +417,180 @@ class LambdaTagTest(BaseTest):
                     }
                 ],
             },
-            config=Config.empty(),
+            config={'region': 'us-west-2',
+                    'account_id': '644160558196'},
             session_factory=session_factory,
         )
         resources = policy.run()
         self.assertEqual(len(resources), 1)
-        arn = resources[0]["FunctionArn"]
-        tags = client.list_tags(Resource=arn)["Tags"]
-        self.assertTrue("custodian_next" in tags.keys())
 
-        policy = self.load_policy(
+        arn = resources[0]["FunctionArn"]
+        after_tags = client.list_tags(Resource=arn)["Tags"]
+        before_tags = {
+            t['Key']: t['Value'] for t in resources[0]['Tags']}
+
+        self.assertEqual(before_tags, {'xyz': 'abcdef'})
+        self.assertEqual(
+            after_tags,
+            {'custodian_next': 'Resource does not meet policy: delete@2019/02/09',
+             'xyz': 'abcdef'})
+
+
+class TestModifyVpcSecurityGroupsAction(BaseTest):
+
+    def test_lambda_remove_matched_security_groups(self):
+
+        # Test conditions:
+        #   - list with two functions, matching only one "resource-fixer"
+        #    - this function is in a VPC and has 3 SGs attached
+        #    - removing a third SG, "sg_controllers" (sg-c573e6b3)
+        #    - start with 3 SGs, end with 2, match function by regex
+
+        session_factory = self.replay_flight_data(
+            "test_lambda_remove_matched_security_groups"
+        )
+
+        p = self.load_policy(
             {
-                "name": "lambda-mark-filter",
+                "name": "lambda-remove-matched-security-groups",
                 "resource": "lambda",
                 "filters": [
-                    {"type": "marked-for-op", "tag": "custodian_next", "op": "delete"}
+                    {
+                        "type": "value",
+                        "key": "FunctionName",
+                        "value": "resource-fixer",
+                        "op": "eq",
+                    },
+                    {
+                        "type": "security-group",
+                        "key": "GroupName",
+                        "value": ".*controllers",
+                        "op": "regex",
+                    }
+                ],
+                "actions": [
+                    {
+                        "type": "modify-security-groups",
+                        "remove": "matched",
+                        "isolation-group": "sg-01a19f602ecaf25f4",
+                    }
                 ],
             },
-            config=Config.empty(),
             session_factory=session_factory,
         )
-        resources = policy.run()
+
+        resources = p.run()
+        client = session_factory().client('lambda')
+        response = client.list_functions()
+        clean_resources = response['Functions']
+
         self.assertEqual(len(resources), 1)
+        self.assertIn("fixer", resources[0]["FunctionName"])
+        self.assertEqual(len(resources[0]["VpcConfig"]["SecurityGroupIds"]), 3)
+        # check result is expected
+        self.assertEqual(len(clean_resources[0]["VpcConfig"]["SecurityGroupIds"]), 2)
+        self.assertNotIn("sg-c573e6b3", clean_resources[0]["VpcConfig"]["SecurityGroupIds"])
+        # verify by name that the removed SG is not there
+
+    def test_lambda_add_security_group(self):
+
+        # Test conditions:
+        #   - list with two functions, matching only one "resource-fixer"
+        #    - this function is in a VPC and has 2 SGs attached
+        #    - adding a third SG, "sg_controllers" (sg-c573e6b3)
+        #    - start with 2 SGs, end with 3, match functuin by exact name
+
+        session_factory = self.replay_flight_data("test_lambda_add_security_group")
+
+        p = self.load_policy(
+            {
+                "name": "add-sg-to-lambda",
+                "resource": "lambda",
+                "filters": [
+                    {
+                        "type": "value",
+                        "key": "FunctionName",
+                        "value": ".*",
+                        "op": "regex",
+                    },
+                ],
+                "actions": [{"type": "modify-security-groups", "add": "sg-c573e6b3"}],
+            },
+            session_factory=session_factory,
+        )
+
+        resources = p.run()
+
+        client = session_factory().client('lambda')
+        response = client.list_functions()
+        clean_resources = response['Functions']
+
+        self.assertEqual(len(resources), 2)
+        self.assertEqual("resource-fixer", resources[0]["FunctionName"])
+        self.assertEqual(len(resources[0]["VpcConfig"]["SecurityGroupIds"]), 2)
+        self.assertNotIn("sg-c573e6b3", resources[0]["VpcConfig"]["SecurityGroupIds"])
+        # check SG was added
+        self.assertEqual(len(clean_resources[0]["VpcConfig"]["SecurityGroupIds"]), 3)
+        self.assertIn("sg-c573e6b3", clean_resources[0]["VpcConfig"]["SecurityGroupIds"])
+
+    def test_nonvpc_function(self):
+
+        session_factory = self.replay_flight_data("test_lambda_add_security_group")
+
+        p = self.load_policy(
+            {
+                "name": "test-with-nonvpc-lambda",
+                "resource": "lambda",
+                "filters": [
+                    {
+                        "type": "value",
+                        "key": "FunctionName",
+                        "value": "test-func.*",
+                        "op": "regex",
+                    },
+                ],
+                "actions": [{"type": "modify-security-groups", "add": "sg-c573e6b3"}],
+            },
+            session_factory=session_factory,
+        )
+
+        resources = p.run()
+
+        self.assertEqual(len(resources), 1)
+        self.assertEqual("test-func-2", resources[0]["FunctionName"])
+
+    def test_lambda_notfound_exception(self):
+        error_response = {'Error': {'Code': 'ResourceNotFoundException'}}
+        operation_name = 'UpdateFunctionConfiguration'
+        with patch("c7n.resources.awslambda.local_session") as mock_local_session:
+            updatefunc = mock_local_session.client.update_function_configuration
+            updatefunc.side_effect = ClientError(error_response, operation_name)
+            with self.assertRaises(ClientError):
+                groups = ['sg-12121212', 'sg-34343434']
+                updatefunc(FunctionName='badname', VpcConfig={'SecurityGroupIds': groups})
+                updatefunc.assert_called_once()
+
+    def test_lambda_kms_alias(self):
+        session_factory = self.replay_flight_data("test_lambda_kms_key_filter")
+        kms = session_factory().client('kms')
+        p = self.load_policy(
+            {
+                "name": "lambda-kms-alias",
+                "resource": "lambda",
+                "filters": [
+                    {
+                        'FunctionName': "test"
+                    },
+                    {
+                        "type": "kms-key",
+                        "key": "c7n:AliasName",
+                        "value": "alias/skunk/trails",
+                    }
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertTrue(len(resources), 1)
+        aliases = kms.list_aliases(KeyId=resources[0]['KMSKeyArn'])
+        self.assertEqual(aliases['Aliases'][0]['AliasName'], 'alias/skunk/trails')

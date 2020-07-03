@@ -22,8 +22,6 @@ import logging
 import traceback
 import zlib
 
-import six
-
 from .email_delivery import EmailDelivery
 from .sns_delivery import SnsDelivery
 
@@ -32,7 +30,7 @@ from c7n_mailer.utils import kms_decrypt
 DATA_MESSAGE = "maidmsg/1.0"
 
 
-class MailerSqsQueueIterator(object):
+class MailerSqsQueueIterator:
     # Copied from custodian to avoid runtime library dependency
     msg_attributes = ['sequence_id', 'op', 'ser']
 
@@ -55,7 +53,9 @@ class MailerSqsQueueIterator(object):
             QueueUrl=self.queue_url,
             WaitTimeSeconds=self.timeout,
             MaxNumberOfMessages=3,
-            MessageAttributeNames=self.msg_attributes)
+            MessageAttributeNames=self.msg_attributes,
+            AttributeNames=['SentTimestamp']
+        )
 
         msgs = response.get('Messages', [])
         self.logger.debug('Messages received %d', len(msgs))
@@ -73,7 +73,7 @@ class MailerSqsQueueIterator(object):
             ReceiptHandle=m['ReceiptHandle'])
 
 
-class MailerSqsQueueProcessor(object):
+class MailerSqsQueueProcessor:
 
     def __init__(self, config, session, logger, max_num_processes=16):
         self.config = config
@@ -81,6 +81,7 @@ class MailerSqsQueueProcessor(object):
         self.session = session
         self.max_num_processes = max_num_processes
         self.receive_queue = self.config['queue_url']
+        self.endpoint_url = self.config.get('endpoint_url', None)
         if self.config.get('debug', False):
             self.logger.debug('debug logging is turned on from mailer config file.')
             logger.setLevel(logging.DEBUG)
@@ -103,7 +104,7 @@ class MailerSqsQueueProcessor(object):
     """
     def run(self, parallel=False):
         self.logger.info("Downloading messages from the SQS queue.")
-        aws_sqs = self.session.client('sqs')
+        aws_sqs = self.session.client('sqs', endpoint_url=self.endpoint_url)
         sqs_messages = MailerSqsQueueIterator(aws_sqs, self.receive_queue, self.logger)
 
         sqs_messages.msg_attributes = ['mtype', 'recipient']
@@ -158,7 +159,7 @@ class MailerSqsQueueProcessor(object):
         # and send any emails (to SES or SMTP) if there are email addresses found
         email_delivery = EmailDelivery(self.config, self.session, self.logger)
         to_addrs_to_email_messages_map = email_delivery.get_to_addrs_email_messages_map(sqs_message)
-        for email_to_addrs, mimetext_msg in six.iteritems(to_addrs_to_email_messages_map):
+        for email_to_addrs, mimetext_msg in to_addrs_to_email_messages_map.items():
             email_delivery.send_c7n_email(sqs_message, list(email_to_addrs), mimetext_msg)
 
         # this sections gets the map of sns_to_addresses to rendered_jinja messages
@@ -169,7 +170,8 @@ class MailerSqsQueueProcessor(object):
 
         # this section sends a notification to the resource owner via Slack
         if any(e.startswith('slack') or e.startswith('https://hooks.slack.com/')
-                for e in sqs_message.get('action', ()).get('to')):
+                for e in sqs_message.get('action', ()).get('to', []) +
+                sqs_message.get('action', ()).get('owner_absent_contact', [])):
             from .slack_delivery import SlackDelivery
 
             if self.config.get('slack_token'):
@@ -192,6 +194,23 @@ class MailerSqsQueueProcessor(object):
 
             try:
                 datadog_delivery.deliver_datadog_messages(datadog_message_packages, sqs_message)
+            except Exception:
+                traceback.print_exc()
+                pass
+
+        # this section sends the full event to a Splunk HTTP Event Collector (HEC)
+        if any(
+            e.startswith('splunkhec://')
+            for e in sqs_message.get('action', ()).get('to')
+        ):
+            from .splunk_delivery import SplunkHecDelivery
+            splunk_delivery = SplunkHecDelivery(self.config, self.session, self.logger)
+            splunk_messages = splunk_delivery.get_splunk_payloads(
+                sqs_message, encoded_sqs_message['Attributes']['SentTimestamp']
+            )
+
+            try:
+                splunk_delivery.deliver_splunk_messages(splunk_messages)
             except Exception:
                 traceback.print_exc()
                 pass

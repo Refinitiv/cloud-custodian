@@ -1,5 +1,4 @@
 import logging
-import six
 
 from abc import ABCMeta, abstractmethod
 
@@ -7,14 +6,13 @@ from c7n.utils import local_session
 from c7n_azure.session import Session
 
 
-@six.add_metaclass(ABCMeta)
-class DeploymentUnit:
+class DeploymentUnit(metaclass=ABCMeta):
+    log = logging.getLogger('custodian.azure.deployment_unit.DeploymentUnit')
 
     def __init__(self, client):
         self.type = ""
         self.session = local_session(Session)
         self.client = self.session.client(client)
-        self.log = logging.getLogger('custodian.azure.function_app_utils')
 
     def get(self, params):
         result = self._get(params)

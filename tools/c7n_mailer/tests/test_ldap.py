@@ -15,11 +15,17 @@
 import unittest
 
 from common import get_ldap_lookup, PETER, BILL
+from c7n_mailer.ldap_lookup import have_sqlite
+
+
+SKIP_REASON = "Azure Pipelines still broken"
 
 
 class MailerLdapTest(unittest.TestCase):
 
     def setUp(self):
+        if not have_sqlite:
+            return
         self.ldap_lookup = get_ldap_lookup(cache_engine='sqlite')
 
     def test_sqlite_cached_get_mail(self):

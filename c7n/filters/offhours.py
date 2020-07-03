@@ -233,8 +233,6 @@ might look like:
             - start
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 # note we have to module import for our testing mocks
 import datetime
 import logging
@@ -259,7 +257,10 @@ def parens_removed(u):
 
 
 class Time(Filter):
-
+    """
+    Schedule offhours for resources see :ref:`offhours <offhours>`
+    for features and configuration.
+    """
     schema = {
         'type': 'object',
         'properties': {
@@ -273,7 +274,7 @@ class Time(Filter):
             'skip-days-from': ValuesFrom.schema,
         }
     }
-
+    schema_alias = True
     time_type = None
 
     # Defaults and constants
@@ -518,7 +519,7 @@ class OnHour(Time):
         return default
 
 
-class ScheduleParser(object):
+class ScheduleParser:
     """Parses tag values for custom on/off hours schedules.
 
     At the minimum the ``on`` and ``off`` values are required. Each of

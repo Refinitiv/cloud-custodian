@@ -11,33 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import six
 
 from c7n.actions import BaseAction
 from c7n.exceptions import PolicyValidationError
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 from c7n.tags import RemoveTag, Tag, TagActionFilter, TagDelayedAction
 from c7n.filters.vpc import SubnetFilter, SecurityGroupFilter
+from c7n.filters.kms import KmsRelatedFilter
 
 
 @resources.register('sagemaker-notebook')
 class NotebookInstance(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sagemaker'
         enum_spec = ('list_notebook_instances', 'NotebookInstances', None)
         detail_spec = (
             'describe_notebook_instance', 'NotebookInstanceName',
             'NotebookInstanceName', None)
-        id = 'NotebookInstanceArn'
+        arn = id = 'NotebookInstanceArn'
         name = 'NotebookInstanceName'
         date = 'CreationTime'
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::SageMaker::NotebookInstance'
 
     permissions = ('sagemaker:ListTags',)
 
@@ -53,8 +50,7 @@ class NotebookInstance(QueryResourceManager):
 
         # Describe notebook-instance & then list tags
         resources = super(NotebookInstance, self).augment(resources)
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_augment, resources)))
+        return list(map(_augment, resources))
 
 
 NotebookInstance.filter_registry.register('marked-for-op', TagActionFilter)
@@ -63,20 +59,16 @@ NotebookInstance.filter_registry.register('marked-for-op', TagActionFilter)
 @resources.register('sagemaker-job')
 class SagemakerJob(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sagemaker'
         enum_spec = ('list_training_jobs', 'TrainingJobSummaries', None)
         detail_spec = (
             'describe_training_job', 'TrainingJobName', 'TrainingJobName', None)
-        id = 'TrainingJobArn'
+        arn = id = 'TrainingJobArn'
         name = 'TrainingJobName'
         date = 'CreationTime'
-        dimension = None
-        filter_name = None
-
-    permissions = (
-        'sagemaker:ListTrainingJobs', 'sagemaker:DescribeTrainingJobs',
-        'sagemaker:ListTags')
+        permission_augment = (
+            'sagemaker:DescribeTrainingJob', 'sagemaker:ListTags')
 
     def __init__(self, ctx, data):
         super(SagemakerJob, self).__init__(ctx, data)
@@ -103,28 +95,23 @@ class SagemakerJob(QueryResourceManager):
             return j
 
         jobs = super(SagemakerJob, self).augment(jobs)
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_augment, jobs)))
+        return list(map(_augment, jobs))
 
 
 @resources.register('sagemaker-transform-job')
 class SagemakerTransformJob(QueryResourceManager):
 
-    class resource_type(object):
-        type = 'None'
+    class resource_type(TypeInfo):
+        arn_type = "transform-job"
         service = 'sagemaker'
         enum_spec = ('list_transform_jobs', 'TransformJobSummaries', None)
         detail_spec = (
             'describe_transform_job', 'TransformJobName', 'TransformJobName', None)
-        id = 'TransformJobArn'
+        arn = id = 'TransformJobArn'
         name = 'TransformJobName'
         date = 'CreationTime'
-        dimension = None
         filter_name = 'TransformJobArn'
-
-    permissions = (
-        'sagemaker:ListTransformJobs', 'sagemaker:DescribeTransformJobs',
-        'sagemaker:ListTags')
+        permission_augment = ('sagemaker:DescribeTransformJob', 'sagemaker:ListTags')
 
     def __init__(self, ctx, data):
         super(SagemakerTransformJob, self).__init__(ctx, data)
@@ -150,13 +137,10 @@ class SagemakerTransformJob(QueryResourceManager):
             j['Tags'] = tags
             return j
 
-        jobs = super(SagemakerTransformJob, self).augment(jobs)
-        for j in jobs:
-            _augment(j)
-        return jobs
+        return list(map(_augment, super(SagemakerTransformJob, self).augment(jobs)))
 
 
-class QueryFilter(object):
+class QueryFilter:
 
     JOB_FILTERS = ('StatusEquals', 'NameContains',)
 
@@ -212,7 +196,7 @@ class QueryFilter(object):
 
     def query(self):
         value = self.value
-        if isinstance(self.value, six.string_types):
+        if isinstance(self.value, str):
             value = [self.value]
         return {'Name': self.key, 'Value': value}
 
@@ -220,17 +204,16 @@ class QueryFilter(object):
 @resources.register('sagemaker-endpoint')
 class SagemakerEndpoint(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sagemaker'
         enum_spec = ('list_endpoints', 'Endpoints', None)
         detail_spec = (
             'describe_endpoint', 'EndpointName',
             'EndpointName', None)
-        id = 'EndpointArn'
+        arn = id = 'EndpointArn'
         name = 'EndpointName'
         date = 'CreationTime'
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::SageMaker::Endpoint'
 
     permissions = ('sagemaker:ListTags',)
 
@@ -245,8 +228,7 @@ class SagemakerEndpoint(QueryResourceManager):
 
         # Describe endpoints & then list tags
         endpoints = super(SagemakerEndpoint, self).augment(endpoints)
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_augment, endpoints)))
+        return list(map(_augment, endpoints))
 
 
 SagemakerEndpoint.filter_registry.register('marked-for-op', TagActionFilter)
@@ -255,17 +237,16 @@ SagemakerEndpoint.filter_registry.register('marked-for-op', TagActionFilter)
 @resources.register('sagemaker-endpoint-config')
 class SagemakerEndpointConfig(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'sagemaker'
         enum_spec = ('list_endpoint_configs', 'EndpointConfigs', None)
         detail_spec = (
             'describe_endpoint_config', 'EndpointConfigName',
             'EndpointConfigName', None)
-        id = 'EndpointConfigArn'
+        arn = id = 'EndpointConfigArn'
         name = 'EndpointConfigName'
         date = 'CreationTime'
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::SageMaker::EndpointConfig'
 
     permissions = ('sagemaker:ListTags',)
 
@@ -279,8 +260,7 @@ class SagemakerEndpointConfig(QueryResourceManager):
             return e
 
         endpoints = super(SagemakerEndpointConfig, self).augment(endpoints)
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_augment, endpoints)))
+        return list(map(_augment, endpoints))
 
 
 SagemakerEndpointConfig.filter_registry.register('marked-for-op', TagActionFilter)
@@ -288,17 +268,17 @@ SagemakerEndpointConfig.filter_registry.register('marked-for-op', TagActionFilte
 
 @resources.register('sagemaker-model')
 class Model(QueryResourceManager):
-    class resource_type(object):
+
+    class resource_type(TypeInfo):
         service = 'sagemaker'
         enum_spec = ('list_models', 'Models', None)
         detail_spec = (
             'describe_model', 'ModelName',
             'ModelName', None)
-        id = 'ModelArn'
+        arn = id = 'ModelArn'
         name = 'ModelName'
         date = 'CreationTime'
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::SageMaker::Model'
 
     permissions = ('sagemaker:ListTags',)
 
@@ -311,31 +291,10 @@ class Model(QueryResourceManager):
             r.setdefault('Tags', []).extend(tags)
             return r
 
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_augment, resources)))
+        return list(map(_augment, resources))
 
 
 Model.filter_registry.register('marked-for-op', TagActionFilter)
-
-
-class StateTransitionFilter(object):
-    """Filter instances by state.
-
-    Try to simplify construction for policy authors by automatically
-    filtering elements (filters or actions) to the instances states
-    they are valid for.
-
-    """
-    valid_origin_states = ()
-
-    def filter_instance_state(self, instances, states=None):
-        states = states or self.valid_origin_states
-        orig_length = len(instances)
-        results = [i for i in instances
-                   if i['NotebookInstanceStatus'] in states]
-        self.log.info("state filter %s %d of %d notebook instances" % (
-            self.__class__.__name__, len(results), orig_length))
-        return results
 
 
 @SagemakerEndpoint.action_registry.register('tag')
@@ -391,15 +350,10 @@ class TagNotebookInstance(Tag):
     """
     permissions = ('sagemaker:AddTags',)
 
-    def process_resource_set(self, resources, tags):
-        client = local_session(
-            self.manager.session_factory).client('sagemaker')
-
-        tag_list = []
-        for t in tags:
-            tag_list.append({'Key': t['Key'], 'Value': t['Value']})
+    def process_resource_set(self, client, resources, tags):
+        mid = self.manager.resource_type.id
         for r in resources:
-            client.add_tags(ResourceArn=r[self.id_key], Tags=tag_list)
+            client.add_tags(ResourceArn=r[mid], Tags=tags)
 
 
 @SagemakerEndpoint.action_registry.register('remove-tag')
@@ -451,10 +405,7 @@ class RemoveTagNotebookInstance(RemoveTag):
     """
     permissions = ('sagemaker:DeleteTags',)
 
-    def process_resource_set(self, resources, keys):
-        client = local_session(
-            self.manager.session_factory).client('sagemaker')
-
+    def process_resource_set(self, client, resources, keys):
         for r in resources:
             client.delete_tags(ResourceArn=r[self.id_key], TagKeys=keys)
 
@@ -502,27 +453,15 @@ class MarkNotebookInstanceForOp(TagDelayedAction):
                 op: delete
                 days: 1
     """
-    permissions = ('sagemaker:AddTags',)
-
-    def process_resource_set(self, resources, tags):
-        client = local_session(
-            self.manager.session_factory).client('sagemaker')
-
-        tag_list = []
-        for t in tags:
-            tag_list.append({'Key': t['Key'], 'Value': t['Value']})
-
-        for r in resources:
-            client.add_tags(ResourceArn=r[self.id_key], Tags=tag_list)
 
 
 @NotebookInstance.action_registry.register('start')
-class StartNotebookInstance(BaseAction, StateTransitionFilter):
+class StartNotebookInstance(BaseAction):
     """Start sagemaker-notebook(s)
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: start-sagemaker-notebook
@@ -535,7 +474,8 @@ class StartNotebookInstance(BaseAction, StateTransitionFilter):
     valid_origin_states = ('Stopped',)
 
     def process(self, resources):
-        resources = self.filter_instance_state(resources)
+        resources = self.filter_resources(resources, 'NotebookInstanceStatus',
+                                          self.valid_origin_states)
         if not len(resources):
             return
 
@@ -550,12 +490,12 @@ class StartNotebookInstance(BaseAction, StateTransitionFilter):
 
 
 @NotebookInstance.action_registry.register('stop')
-class StopNotebookInstance(BaseAction, StateTransitionFilter):
+class StopNotebookInstance(BaseAction):
     """Stop sagemaker-notebook(s)
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: stop-sagemaker-notebook
@@ -570,7 +510,8 @@ class StopNotebookInstance(BaseAction, StateTransitionFilter):
     valid_origin_states = ('InService',)
 
     def process(self, resources):
-        resources = self.filter_instance_state(resources)
+        resources = self.filter_resources(resources, 'NotebookInstanceStatus',
+                                          self.valid_origin_states)
         if not len(resources):
             return
 
@@ -585,12 +526,12 @@ class StopNotebookInstance(BaseAction, StateTransitionFilter):
 
 
 @NotebookInstance.action_registry.register('delete')
-class DeleteNotebookInstance(BaseAction, StateTransitionFilter):
+class DeleteNotebookInstance(BaseAction):
     """Deletes sagemaker-notebook(s)
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: delete-sagemaker-notebook
@@ -605,7 +546,8 @@ class DeleteNotebookInstance(BaseAction, StateTransitionFilter):
     valid_origin_states = ('Stopped', 'Failed',)
 
     def process(self, resources):
-        resources = self.filter_instance_state(resources)
+        resources = self.filter_resources(resources, 'NotebookInstanceStatus',
+                                          self.valid_origin_states)
         if not len(resources):
             return
 
@@ -631,13 +573,43 @@ class NotebookSubnetFilter(SubnetFilter):
     RelatedIdsExpression = "SubnetId"
 
 
+@NotebookInstance.filter_registry.register('kms-key')
+@SagemakerEndpointConfig.filter_registry.register('kms-key')
+class NotebookKmsFilter(KmsRelatedFilter):
+    """
+    Filter a resource by its associcated kms key and optionally the aliasname
+    of the kms key by using 'c7n:AliasName'
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+          - name: sagemaker-kms-key-filters
+            resource: aws.sagemaker-notebook
+            filters:
+              - type: kms-key
+                key: c7n:AliasName
+                value: "^(alias/aws/sagemaker)"
+                op: regex
+
+          - name: sagemaker-endpoint-kms-key-filters
+            resource: aws.sagemaker-endpoint-config
+            filters:
+              - type: kms-key
+                key: c7n:AliasName
+                value: "alias/aws/sagemaker"
+    """
+    RelatedIdsExpression = "KmsKeyId"
+
+
 @Model.action_registry.register('delete')
-class DeleteModel(BaseAction, StateTransitionFilter):
+class DeleteModel(BaseAction):
     """Deletes sagemaker-model(s)
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: delete-sagemaker-model
@@ -695,7 +667,7 @@ class SagemakerEndpointDelete(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: delete-sagemaker-endpoint
@@ -725,7 +697,7 @@ class SagemakerEndpointConfigDelete(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: delete-sagemaker-endpoint-config
@@ -757,7 +729,7 @@ class SagemakerTransformJobStop(BaseAction):
     .. code-block:: yaml
 
         policies:
-          - name: stop-ml-job
+          - name: stop-tranform-job
             resource: sagemaker-transform-job
             filters:
               - TransformJobName: ml-job-10

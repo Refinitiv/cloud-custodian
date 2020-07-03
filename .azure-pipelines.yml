@@ -5,67 +5,48 @@ variables:
 - group: CustodianCoreCI
 
 jobs:
-
-- job: 'Lint'
+- job: 'CustodianCask'
+  displayName: 'Tool Tests - Cask'
   pool:
-    vmImage: 'Ubuntu-16.04'
-
+    vmImage: 'Ubuntu-18.04'
   steps:
-    - task: UsePythonVersion@0
-      inputs:
-        versionSpec: '2.7'
-        architecture: 'x64'
-    - script: python -m pip install --upgrade pip && pip install flake8==3.5.0
-      displayName: "Install Dependencies"
-    - script: make lint
-      displayName: "Flake8 Lint"
+  - checkout: self
+    fetchDepth: 1
+  - task: GoTool@0
+    inputs:
+      version: '1.12.6'
+  - script: make test
+    workingDirectory: tools/cask/
 
-- job: 'Test'
-  condition: "succeeded()"
+- job: 'CustodianOmniSSM'
+  displayName: 'Tool Tests - OmniSSM'
   pool:
-    vmImage: 'Ubuntu-16.04'
-  strategy:
-    matrix:
-      Python27:
-        python.version: '2.7'
-        TOXENV: py27-cov
-      Python36:
-        python.version: '3.6'
-        TOXENV: py36
-      Python37:
-        python.version: '3.7'
-        TOXENV: py37
-    maxParallel: 3
-
+    vmImage: 'Ubuntu-18.04'
   steps:
+  - checkout: self
+    fetchDepth: 1
+  - task: GoTool@0
+    inputs:
+      version: '1.12.6'
+  - script: make test
+    workingDirectory: tools/omnissm/
+
+- job: 'CustodianDockerBuild'
+  displayName: 'Docker Build'
+  pool:
+    vmImage: 'Ubuntu-18.04'
+  steps:
+  - checkout: self
+    fetchDepth: 1
   - task: UsePythonVersion@0
-    displayName: "Set Python Version"
     inputs:
-      versionSpec: '$(python.version)'
+      versionSpec: 3.8
       architecture: 'x64'
+  # bin directory is in .dockerignore
+  - script: |
+      python -m pip install --upgrade pip
+      pip install docker click pytest pyyaml
+  # build a docker image and sanity test
+  - script: |
+      python tools/dev/dockerpkg.py build -t build --verbose --test -i cli-distroless
 
-  - script: python -m pip install --upgrade pip && pip install tox codecov
-    displayName: 'Install Test Runner'
-
-  - script: tox --notest
-    displayName: 'Install Dependencies'
-
-  - script: tox
-    displayName: 'Tox'
-
-  - script: codecov --branch $BRANCH --pr $PR --commit $COMMIT --build $BUILD_ID
-    displayName: 'Publish Code Coverage'
-    condition: "eq(variables['python.version'], '2.7')"
-    env:
-      BUILD_ID: $(Build.BuildNumber)
-      CODECOV_TOKEN: $(CODECOV_TOKEN)
-      PR: $(system.pullRequest.pullRequestNumber)
-      BRANCH: $(system.pullRequest.sourceBranch)
-      COMMIT: $(system.pullRequest.sourceCommitId)
-
-  - task: PublishTestResults@2
-    displayName: "Publish Test Results Azure"
-    inputs:
-      testResultsFiles: '**/test-results.xml'
-      testRunTitle: 'Python $(python.version)'
-    condition: succeededOrFailed()

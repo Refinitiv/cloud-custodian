@@ -51,8 +51,6 @@ OrgMode
    to sentry projects
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import argparse
 import base64
 from datetime import datetime
@@ -61,6 +59,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlparse
 import uuid
 import zlib
 
@@ -70,7 +69,6 @@ from botocore.exceptions import ClientError
 from botocore.vendored import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil.parser import parse as parse_date
-from six.moves.urllib.parse import urlparse
 
 from c7n.config import Bag
 
@@ -344,7 +342,7 @@ def get_function(session_factory, name, handler, runtime, role,
             CloudWatchLogSubscription(
                 session_factory, log_groups, pattern)])
 
-    archive = PythonPackageArchive('c7n_sentry')
+    archive = PythonPackageArchive(modules=['c7n_sentry'])
     archive.add_contents(
         'config.json', json.dumps({
             'project': project,
@@ -376,8 +374,8 @@ def orgreplay(options):
         "@" in dsn.netloc and dsn.netloc.rsplit('@', 1)[1] or dsn.netloc)
 
     log.info("sentry endpoint: %s", endpoint)
-    teams = set([t['slug'] for t in sget(
-        endpoint + "organizations/%s/teams/" % options.sentry_org).json()])
+    teams = {t['slug'] for t in sget(
+             endpoint + "organizations/%s/teams/" % options.sentry_org).json()}
     projects = {p['name']: p for p in sget(endpoint + "projects/").json()}
 
     def process_account(a):

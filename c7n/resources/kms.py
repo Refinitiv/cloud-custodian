@@ -11,63 +11,73 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
-from concurrent.futures import as_completed
 
 import json
-import logging
 
 from c7n.actions import RemovePolicyBase, BaseAction
 from c7n.filters import Filter, CrossAccountAccessFilter, ValueFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
-from c7n.utils import local_session, type_schema
+from c7n.query import (
+    ConfigSource, DescribeSource, QueryResourceManager, RetryPageIterator, TypeInfo)
+from c7n.utils import local_session, type_schema, select_keys
 from c7n.tags import universal_augment
 
-log = logging.getLogger('custodian.kms')
+from .securityhub import PostFinding
 
 
 @resources.register('kms')
 class KeyAlias(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'kms'
-        type = 'key-alias'
+        arn_type = 'alias'
         enum_spec = ('list_aliases', 'Aliases', None)
         name = "AliasName"
         id = "AliasArn"
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::KMS::Alias'
 
     def augment(self, resources):
         return [r for r in resources if 'TargetKeyId' in r]
 
 
-@resources.register('kms-key')
-class Key(QueryResourceManager):
+class DescribeKey(DescribeSource):
 
-    class resource_type(object):
-        service = 'kms'
-        type = "key"
-        enum_spec = ('list_keys', 'Keys', None)
-        name = "KeyId"
-        id = "KeyArn"
-        dimension = None
-        filter_name = None
-        universal_taggable = True
+    FetchThreshold = 10  # ie should we describe all keys or just fetch them directly
+
+    def get_resources(self, ids, cache=True):
+        # this forms a threshold beyond which we'll fetch individual keys of interest.
+        # else we'll need to fetch through the full set and client side filter.
+        if len(ids) < self.FetchThreshold:
+            client = local_session(self.manager.session_factory).client('kms')
+            results = []
+            for rid in ids:
+                try:
+                    results.append(
+                        self.manager.retry(
+                            client.describe_key,
+                            KeyId=rid)['KeyMetadata'])
+                except client.exceptions.NotFoundException:
+                    continue
+            return results
+        return super().get_resources(ids, cache)
 
     def augment(self, resources):
-        client = local_session(
-            self.session_factory).client('kms')
+        aliases = KeyAlias(self.manager.ctx, {}).resources()
+        alias_map = {}
+        for a in aliases:
+            key_id = a['TargetKeyId']
+            alias_map[key_id] = alias_map.get(key_id, []) + [a['AliasName']]
 
+        client = local_session(self.manager.session_factory).client('kms')
         for r in resources:
             try:
-                key_id = r.get('KeyArn')
-                info = client.describe_key(KeyId=key_id)['KeyMetadata']
+                key_id = r.get('KeyId')
+                key_arn = r.get('KeyArn', key_id)
+                info = client.describe_key(KeyId=key_arn)['KeyMetadata']
+                if key_id in alias_map:
+                    info['AliasNames'] = alias_map[key_id]
                 r.update(info)
-
             except ClientError as e:
                 if e.response['Error']['Code'] == 'AccessDeniedException':
                     self.log.warning(
@@ -76,7 +86,25 @@ class Key(QueryResourceManager):
                 else:
                     raise
 
-        return universal_augment(self, resources)
+        return universal_augment(self.manager, resources)
+
+
+@resources.register('kms-key')
+class Key(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'kms'
+        arn_type = "key"
+        enum_spec = ('list_keys', 'Keys', None)
+        name = id = "KeyId"
+        arn = 'Arn'
+        universal_taggable = True
+        cfn_type = config_type = 'AWS::KMS::Key'
+
+    source_mapping = {
+        'config': ConfigSource,
+        'describe': DescribeKey
+    }
 
 
 @Key.filter_registry.register('key-rotation-status')
@@ -97,12 +125,13 @@ class KeyRotationStatus(ValueFilter):
     """
 
     schema = type_schema('key-rotation-status', rinherit=ValueFilter.schema)
+    schema_alias = False
     permissions = ('kms:GetKeyRotationStatus',)
 
     def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('kms')
 
         def _key_rotation_status(resource):
-            client = local_session(self.manager.session_factory).client('kms')
             try:
                 resource['KeyRotationEnabled'] = client.get_key_rotation_status(
                     KeyId=resource['KeyId'])
@@ -135,7 +164,7 @@ class KMSCrossAccountAccessFilter(CrossAccountAccessFilter):
     .. code-block:: yaml
 
             policies:
-              - name: kms-key-cross-account
+              - name: check-kms-key-cross-account
                 resource: kms-key
                 filters:
                   - type: cross-account
@@ -143,9 +172,10 @@ class KMSCrossAccountAccessFilter(CrossAccountAccessFilter):
     permissions = ('kms:GetKeyPolicy',)
 
     def process(self, resources, event=None):
+        client = local_session(
+            self.manager.session_factory).client('kms')
+
         def _augment(r):
-            client = local_session(
-                self.manager.session_factory).client('kms')
             key_id = r.get('TargetKeyId', r.get('KeyId'))
             assert key_id, "Invalid key resources %s" % r
             r['Policy'] = client.get_key_policy(
@@ -183,12 +213,15 @@ class GrantCount(Filter):
     permissions = ('kms:ListGrants',)
 
     def process(self, keys, event=None):
-        with self.executor_factory(max_workers=3) as w:
-            return list(filter(None, (w.map(self.process_key, keys))))
-
-    def process_key(self, key):
         client = local_session(self.manager.session_factory).client('kms')
+        results = []
+        for k in keys:
+            results.append(self.process_key(client, k))
+        return [r for r in results if r]
+
+    def process_key(self, client, key):
         p = client.get_paginator('list_grants')
+        p.PAGE_ITERATOR_CLS = RetryPageIterator
         grant_count = 0
         for rp in p.paginate(KeyId=key['TargetKeyId']):
             grant_count += len(rp['Grants'])
@@ -208,12 +241,12 @@ class GrantCount(Filter):
 class ResourceKmsKeyAlias(ValueFilter):
 
     schema = type_schema('kms-alias', rinherit=ValueFilter.schema)
+    schema_alias = False
 
     def get_permissions(self):
         return KeyAlias(self.manager.ctx, {}).get_permissions()
 
     def get_matching_aliases(self, resources, event=None):
-
         key_aliases = KeyAlias(self.manager.ctx, {}).resources()
         key_aliases_dict = {a['TargetKeyId']: a for a in key_aliases}
 
@@ -300,9 +333,9 @@ class KmsKeyRotation(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
-        policy:
+        policies:
           - name: enable-cmk-rotation
             resource: kms-key
             filters:
@@ -314,26 +347,34 @@ class KmsKeyRotation(BaseAction):
                 state: True
     """
     permissions = ('kms:EnableKeyRotation',)
-    schema = type_schema(
-        'set-rotation',
-        state={'type': 'boolean'})
-
-    def set_rotation(self, key):
-        client = local_session(self.manager.session_factory).client('kms')
-        if self.data.get('state', True):
-            client.enable_key_rotation(KeyId=key['KeyId'])
-            return
-        client.disable_key_rotation(KeyId=key['KeyId'])
+    schema = type_schema('set-rotation', state={'type': 'boolean'})
 
     def process(self, keys):
+        client = local_session(self.manager.session_factory).client('kms')
         for k in keys:
-            futures = {}
+            if self.data.get('state', True):
+                client.enable_key_rotation(KeyId=k['KeyId'])
+                continue
+            client.disable_key_rotation(KeyId=k['KeyId'])
 
-            with self.executor_factory(max_workers=2) as w:
-                futures[w.submit(self.set_rotation, k)] = k
 
-            for f in as_completed(futures):
-                if f.exception():
-                    key = futures[f]
-                    self.log.error('error setting key rotation on %s: %s' % (
-                        key['Arn'], f.exception()))
+@KeyAlias.action_registry.register('post-finding')
+@Key.action_registry.register('post-finding')
+class KmsPostFinding(PostFinding):
+
+    resource_type = 'AwsKmsKey'
+
+    def format_resource(self, r):
+        if 'TargetKeyId' in r:
+            resolved = self.manager.get_resource_manager(
+                'kms-key').get_resources([r['TargetKeyId']])
+            if not resolved:
+                return
+            r = resolved[0]
+            r[self.manager.resource_type.id] = r['KeyId']
+        envelope, payload = self.format_envelope(r)
+        payload.update(self.filter_empty(
+            select_keys(r, [
+                'AWSAccount', 'CreationDate', 'KeyId',
+                'KeyManager', 'Origin', 'KeyState'])))
+        return envelope

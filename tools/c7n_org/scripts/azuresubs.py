@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
-
-import yaml
 import click
 from c7n_azure.session import Session
+from c7n.utils import yaml_dump
 from azure.mgmt.resource.subscriptions import SubscriptionClient
 
 
@@ -24,7 +22,12 @@ from azure.mgmt.resource.subscriptions import SubscriptionClient
 @click.option(
     '-f', '--output', type=click.File('w'),
     help="File to store the generated config (default stdout)")
-def main(output):
+@click.option(
+    '-s', '--state', multiple=True, type=click.Choice(
+        ['Enabled', 'Warned', 'PastDue', 'Disabled', 'Deleted']),
+    default=('Enabled',),
+    help="File to store the generated config (default stdout)")
+def main(output, state):
     """
     Generate a c7n-org subscriptions config file
     """
@@ -33,17 +36,15 @@ def main(output):
     subs = [sub.serialize(True) for sub in client.subscriptions.list()]
     results = []
     for sub in subs:
+        if state and sub['state'] not in state:
+            continue
         sub_info = {
             'subscription_id': sub['subscriptionId'],
             'name': sub['displayName']
         }
         results.append(sub_info)
 
-    print(
-        yaml.safe_dump(
-            {'subscriptions': results},
-            default_flow_style=False),
-        file=output)
+    print(yaml_dump({'subscriptions': results}), file=output)
 
 
 if __name__ == '__main__':
