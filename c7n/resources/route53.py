@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import functools
 import fnmatch
 import json
@@ -21,7 +19,7 @@ import os
 
 from botocore.paginate import Paginator
 
-from c7n.query import QueryResourceManager, ChildResourceManager
+from c7n.query import QueryResourceManager, ChildResourceManager, TypeInfo
 from c7n.manager import resources
 from c7n.utils import chunks, get_retry, generate_arn, local_session, type_schema
 from c7n.actions import BaseAction
@@ -31,7 +29,7 @@ from c7n.resources.shield import IsShieldProtected, SetShieldProtection
 from c7n.tags import RemoveTag, Tag
 
 
-class Route53Base(object):
+class Route53Base:
 
     permissions = ('route53:ListTagsForResources',)
     retry = staticmethod(get_retry(('Throttled',)))
@@ -42,7 +40,7 @@ class Route53Base(object):
             self._generate_arn = functools.partial(
                 generate_arn,
                 self.get_model().service,
-                resource_type=self.get_model().type)
+                resource_type=self.get_model().arn_type)
         return self._generate_arn
 
     def get_arn(self, r):
@@ -70,7 +68,7 @@ def _describe_route53_tags(
         for resource_batch in chunks(list(resource_map.keys()), 10):
             results = retry(
                 client.list_tags_for_resources,
-                ResourceType=model.type,
+                ResourceType=model.arn_type,
                 ResourceIds=resource_batch)
             for resource_tag_set in results['ResourceTagSets']:
                 if ('ResourceId' in resource_tag_set and
@@ -84,19 +82,17 @@ def _describe_route53_tags(
 @resources.register('hostedzone')
 class HostedZone(Route53Base, QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'route53'
-        type = 'hostedzone'
+        arn_type = 'hostedzone'
         enum_spec = ('list_hosted_zones', 'HostedZones', None)
         # detail_spec = ('get_hosted_zone', 'Id', 'Id', None)
         id = 'Id'
-        filter_name = None
         name = 'Name'
-        date = None
-        dimension = None
         universal_taggable = True
         # Denotes this resource type exists across regions
         global_resource = True
+        cfn_type = 'AWS::Route53::HostedZone'
 
     def get_arns(self, resource_set):
         arns = []
@@ -113,56 +109,45 @@ HostedZone.action_registry.register('set-shield', SetShieldProtection)
 @resources.register('healthcheck')
 class HealthCheck(Route53Base, QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'route53'
-        type = 'healthcheck'
+        arn_type = 'healthcheck'
         enum_spec = ('list_health_checks', 'HealthChecks', None)
         name = id = 'Id'
-        filter_name = None
-        date = None
-        dimension = None
         universal_taggable = True
+        cfn_type = 'AWS::Route53::HealthCheck'
 
 
 @resources.register('rrset')
 class ResourceRecordSet(ChildResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'route53'
-        type = 'rrset'
+        arn_type = 'rrset'
         parent_spec = ('hostedzone', 'HostedZoneId', None)
         enum_spec = ('list_resource_record_sets', 'ResourceRecordSets', None)
         name = id = 'Name'
-        filter_name = None
-        date = None
-        dimension = None
+        cfn_type = 'AWS::Route53::RecordSet'
 
 
 @resources.register('r53domain')
 class Route53Domain(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'route53domains'
-        type = 'r53domain'
+        arn_type = 'r53domain'
         enum_spec = ('list_domains', 'Domains', None)
         name = id = 'DomainName'
-        filter_name = None
-        date = None
-        dimension = None
 
     permissions = ('route53domains:ListTagsForDomain',)
 
     def augment(self, domains):
         client = local_session(self.session_factory).client('route53domains')
-
-        def _list_tags(d):
-            tags = client.list_tags_for_domain(
+        for d in domains:
+            d['Tags'] = self.retry(
+                client.list_tags_for_domain,
                 DomainName=d['DomainName'])['TagList']
-            d['Tags'] = tags
-            return d
-
-        with self.executor_factory(max_workers=1) as w:
-            return list(filter(None, w.map(_list_tags, domains)))
+        return domains
 
 
 @Route53Domain.action_registry.register('tag')
@@ -171,7 +156,7 @@ class Route53DomainAddTag(Tag):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: route53-tag
@@ -185,13 +170,11 @@ class Route53DomainAddTag(Tag):
     """
     permissions = ('route53domains:UpdateTagsForDomain',)
 
-    def process_resource_set(self, domains, tags):
-        client = local_session(
-            self.manager.session_factory).client('route53domains')
-
+    def process_resource_set(self, client, domains, tags):
+        mid = self.manager.resource_type.id
         for d in domains:
             client.update_tags_for_domain(
-                DomainName=d[self.id_key],
+                DomainName=d[mid],
                 TagsToUpdate=tags)
 
 
@@ -201,7 +184,7 @@ class Route53DomainRemoveTag(RemoveTag):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: route53-expired-tag
@@ -214,10 +197,7 @@ class Route53DomainRemoveTag(RemoveTag):
     """
     permissions = ('route53domains:DeleteTagsForDomain',)
 
-    def process_resource_set(self, domains, keys):
-        client = local_session(
-            self.manager.session_factory).client('route53domains')
-
+    def process_resource_set(self, client, domains, keys):
         for d in domains:
             client.delete_tags_for_domain(
                 DomainName=d[self.id_key],
@@ -244,7 +224,7 @@ class SetQueryLogging(BaseAction):
 
     :example:
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         policies:
           - name: enablednsquerylogging
@@ -264,7 +244,7 @@ class SetQueryLogging(BaseAction):
         'route53:CreateQueryLoggingConfig',
         'route53:DeleteQueryLoggingConfig',
         'logs:DescribeLogGroups',
-        'logs:CreateLogGroups',
+        'logs:CreateLogGroup',
         'logs:GetResourcePolicy',
         'logs:PutResourcePolicy')
 
@@ -300,7 +280,7 @@ class SetQueryLogging(BaseAction):
             perms.extend(('logs:GetResourcePolicy', 'logs:PutResourcePolicy'))
         if self.data.get('state', True):
             perms.append('route53:CreateQueryLoggingConfig')
-            perms.append('logs:CreateLogGroups')
+            perms.append('logs:CreateLogGroup')
             perms.append('logs:DescribeLogGroups')
             perms.append('tag:GetResources')
         else:
@@ -349,7 +329,7 @@ class SetQueryLogging(BaseAction):
             if log_manager.get_resources(list(group_names), augment=False):
                 groups = [{'logGroupName': g} for g in group_names]
         else:
-            common_prefix = os.path.commonprefix(group_names)
+            common_prefix = os.path.commonprefix(list(group_names))
             if common_prefix not in ('', '/'):
                 groups = log_manager.get_resources(
                     [common_prefix], augment=False)

@@ -11,53 +11,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import json
 import datetime
+import functools
 import io
+import jmespath
+import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import unittest
 
-
+import pytest
 import mock
-import six
 import yaml
 
 from c7n import policy
-from c7n.schema import validate as schema_validate
+from c7n.loader import PolicyLoader
 from c7n.ctx import ExecutionContext
 from c7n.utils import reset_session_cache
 from c7n.config import Bag, Config
 
+
 C7N_VALIDATE = bool(os.environ.get("C7N_VALIDATE", ""))
-
 skip_if_not_validating = unittest.skipIf(
-    not C7N_VALIDATE, reason="We are not validating schemas."
-)
+    not C7N_VALIDATE, reason="We are not validating schemas.")
+functional = pytest.mark.functional
 
 
-try:
-    import pytest
-
-    functional = pytest.mark.functional
-except ImportError:
-    functional = lambda func: func  # noqa E731
-
-
-class TestUtils(unittest.TestCase):
+class CustodianTestCore:
 
     custodian_schema = None
+    # thread local? tests are single threaded, multiprocess execution
+    policy_loader = PolicyLoader(Config.empty())
+    policy_loader.default_policy_validate = C7N_VALIDATE
 
-    def tearDown(self):
-        self.cleanUp()
-
-    def cleanUp(self):
-        # Clear out thread local session cache
-        reset_session_cache()
+    def addCleanup(self, func, *args, **kw):
+        raise NotImplementedError("subclass required")
 
     def write_policy_file(self, policy, format="yaml"):
         """ Write a policy file to disk in the specified format.
@@ -65,13 +56,14 @@ class TestUtils(unittest.TestCase):
         Input a dictionary and a format. Valid formats are `yaml` and `json`
         Returns the file path.
         """
-        fh = tempfile.NamedTemporaryFile(mode="w+b", suffix="." + format)
+        fh = tempfile.NamedTemporaryFile(mode="w+b", suffix="." + format, delete=False)
         if format == "json":
             fh.write(json.dumps(policy).encode("utf8"))
         else:
             fh.write(yaml.dump(policy, encoding="utf8", Dumper=yaml.SafeDumper))
 
         fh.flush()
+        self.addCleanup(os.unlink, fh.name)
         self.addCleanup(fh.close)
         return fh.name
 
@@ -91,33 +83,41 @@ class TestUtils(unittest.TestCase):
         return ctx
 
     def load_policy(
-        self,
-        data,
-        config=None,
-        session_factory=None,
-        validate=C7N_VALIDATE,
-        output_dir=None,
-        cache=False,
+            self,
+            data,
+            config=None,
+            session_factory=None,
+            validate=C7N_VALIDATE,
+            output_dir='null://',
+            log_group='null://',
+            cache=False,
     ):
-        if validate:
-            errors = schema_validate({"policies": [data]}, self.custodian_schema)
-            if errors:
-                raise errors[0]
+        pdata = {'policies': [data]}
+        if not (config and isinstance(config, Config)):
+            config = self._get_policy_config(
+                log_group=log_group,
+                output_dir=output_dir,
+                cache=cache, **(config or {}))
+        collection = self.policy_loader.load_data(
+            pdata, validate=validate,
+            file_uri="memory://test",
+            session_factory=session_factory,
+            config=config)
+        # policy non schema validation is also lazy initialization
+        [p.validate() for p in collection]
+        return list(collection)[0]
 
-        config = config or {}
-        if not output_dir:
-            temp_dir = self.get_temp_dir()
-            config["output_dir"] = temp_dir
-        if cache:
+    def _get_policy_config(self, **kw):
+        config = kw
+        if kw.get('output_dir') is None or config.get('cache'):
+            config["output_dir"] = temp_dir = self.get_temp_dir()
+        if config.get('cache'):
             config["cache"] = os.path.join(temp_dir, "c7n.cache")
             config["cache_period"] = 300
-        conf = Config.empty(**config)
-        p = policy.Policy(data, conf, session_factory)
-        p.validate()
-        return p
+        return Config.empty(**config)
 
     def load_policy_set(self, data, config=None):
-        filename = self.write_policy_file(data)
+        filename = self.write_policy_file(data, format="json")
         if config:
             e = Config.empty(**config)
         else:
@@ -162,7 +162,8 @@ class TestUtils(unittest.TestCase):
             os.environ.update(original_environ)
 
         os.environ.clear()
-        for key, value in kwargs.items():
+
+        for key, value in list(kwargs.items()):
             if value is None:
                 del (kwargs[key])
         os.environ.update(kwargs)
@@ -187,6 +188,54 @@ class TestUtils(unittest.TestCase):
 
         return log_file
 
+    # Backport from stdlib for 2.7 compat, drop when 2.7 support is dropped.
+    def assertRegex(self, text, expected_regex, msg=None):
+        """Fail the test unless the text matches the regular expression."""
+        if isinstance(expected_regex, str):
+            assert expected_regex, "expected_regex must not be empty."
+            expected_regex = re.compile(expected_regex)
+        if not expected_regex.search(text):
+            standardMsg = "Regex didn't match: %r not found in %r" % (
+                expected_regex.pattern, text)
+            # _formatMessage ensures the longMessage option is respected
+            msg = self._formatMessage(msg, standardMsg)
+            raise self.failureException(msg)
+
+    def assertJmes(self, expr, instance, expected):
+        value = jmespath.search(expr, instance)
+        self.assertEqual(value, expected)
+
+
+class _TestUtils(unittest.TestCase):
+    # used to expose unittest feature set as a pytest fixture
+    def test_utils(self):
+        """dummy method for py2.7 unittest"""
+
+
+class PyTestUtils(CustodianTestCore):
+    """Pytest compatibile testing utils intended for use as fixture."""
+    def __init__(self, request):
+        self.request = request
+
+        # Copy over asserts from unit test
+        t = _TestUtils('test_utils')
+        for n in dir(t):
+            if n.startswith('assert'):
+                setattr(self, n, getattr(t, n))
+
+    def addCleanup(self, func, *args, **kw):
+        self.request.addfinalizer(functools.partial(func, *args, **kw))
+
+
+class TestUtils(unittest.TestCase, CustodianTestCore):
+
+    def tearDown(self):
+        self.cleanUp()
+
+    def cleanUp(self):
+        # Clear out thread local session cache
+        reset_session_cache()
+
 
 class TextTestIO(io.StringIO):
 
@@ -197,7 +246,7 @@ class TextTestIO(io.StringIO):
         # we want to print from (think: traceback.print_exc) so we can't
         # standardize the arg type up at the call sites. Hack it here.
 
-        if not isinstance(b, six.text_type):
+        if not isinstance(b, str):
             b = b.decode("utf8")
         return super(TextTestIO, self).write(b)
 
@@ -227,10 +276,8 @@ def mock_datetime_now(tgt, dt):
         def utcnow(cls):
             return cls.target
 
-        # Python2 & Python3 compatible metaclass
-
     MockedDatetime = DatetimeSubclassMeta(
-        b"datetime" if str is bytes else "datetime",  # hack Python2/3 port
+        "datetime",
         (BaseMockedDatetime,),
         {},
     )

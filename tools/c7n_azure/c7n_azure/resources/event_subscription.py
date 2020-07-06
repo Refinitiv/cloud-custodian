@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from c7n_azure.actions import AzureBaseAction
+from c7n_azure.actions.base import AzureBaseAction
 from c7n_azure.provider import resources
 from c7n_azure.query import QueryResourceManager
 
@@ -21,7 +21,9 @@ from c7n.filters.core import type_schema
 @resources.register('eventsubscription')
 class EventSubscription(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(QueryResourceManager.resource_type):
+        doc_groups = ['Events']
+
         service = 'azure.mgmt.eventgrid'
         client = 'EventGridManagementClient'
         enum_spec = ('event_subscriptions', 'list_global_by_subscription', None)
@@ -36,8 +38,9 @@ class EventSubscription(QueryResourceManager):
 class Delete(AzureBaseAction):
     schema = type_schema('delete')
 
-    def process_resource_set(self, resources):
-        client = self.manager.get_client()
-        for resource in resources:
-            client.event_subscriptions.delete(
-                resource['properties']['topic'], resource['name'])
+    def _prepare_processing(self,):
+        self.client = self.manager.get_client()
+
+    def _process_resource(self, resource):
+        self.client.event_subscriptions.delete(
+            resource['properties']['topic'], resource['name'])

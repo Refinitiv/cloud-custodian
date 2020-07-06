@@ -11,25 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from .common import BaseTest, functional
 from botocore.exceptions import ClientError
 
 import json
 import time
 
+from c7n.resources.aws import shape_validate
 
-class TestSqsAction(BaseTest):
+
+class TestSqs:
 
     @functional
-    def test_sqs_delete(self):
-        session_factory = self.replay_flight_data("test_sqs_delete")
+    def test_sqs_delete(self, test):
+        session_factory = test.replay_flight_data("test_sqs_delete")
         client = session_factory().client("sqs")
         client.create_queue(QueueName="test-sqs")
         queue_url = client.get_queue_url(QueueName="test-sqs")["QueueUrl"]
 
-        p = self.load_policy(
+        p = test.load_policy(
             {
                 "name": "sqs-delete",
                 "resource": "sqs",
@@ -39,14 +39,14 @@ class TestSqsAction(BaseTest):
             session_factory=session_factory,
         )
         resources = p.run()
-        self.assertEqual(len(resources), 1)
-        self.assertRaises(ClientError, client.purge_queue, QueueUrl=queue_url)
-        if self.recording:
+        test.assertEqual(len(resources), 1)
+        test.assertRaises(ClientError, client.purge_queue, QueueUrl=queue_url)
+        if test.recording:
             time.sleep(60)
 
     @functional
-    def test_sqs_set_encryption(self):
-        session_factory = self.replay_flight_data("test_sqs_set_encryption")
+    def test_sqs_set_encryption(self, test):
+        session_factory = test.replay_flight_data("test_sqs_set_encryption")
 
         client_sqs = session_factory().client("sqs")
         client_sqs.create_queue(QueueName="sqs-test")
@@ -54,10 +54,10 @@ class TestSqsAction(BaseTest):
 
         def cleanup():
             client_sqs.delete_queue(QueueUrl=queue_url)
-            if self.recording:
+            if test.recording:
                 time.sleep(60)
 
-        self.addCleanup(cleanup)
+        test.addCleanup(cleanup)
 
         client_kms = session_factory().client("kms")
         key_id = client_kms.create_key(Description="West SQS encryption key")[
@@ -65,16 +65,16 @@ class TestSqsAction(BaseTest):
         ][
             "KeyId"
         ]
-        self.addCleanup(client_kms.disable_key, KeyId=key_id)
+        test.addCleanup(client_kms.disable_key, KeyId=key_id)
 
         alias_name = "alias/new-key-test-sqs"
-        self.addCleanup(client_kms.delete_alias, AliasName=alias_name)
+        test.addCleanup(client_kms.delete_alias, AliasName=alias_name)
         client_kms.create_alias(AliasName=alias_name, TargetKeyId=key_id)
 
-        if self.recording:
+        if test.recording:
             time.sleep(30)
 
-        p = self.load_policy(
+        p = test.load_policy(
             {
                 "name": "sqs-delete",
                 "resource": "sqs",
@@ -92,7 +92,10 @@ class TestSqsAction(BaseTest):
         ][
             "KmsMasterKeyId"
         ]
-        self.assertEqual(check_master_key, key_id)
+        test.assertEqual(check_master_key, key_id)
+
+
+class QueueTests(BaseTest):
 
     @functional
     def test_sqs_remove_matched(self):
@@ -257,12 +260,172 @@ class TestSqsAction(BaseTest):
         self.assertNotIn("Policy", d2)
 
     @functional
+    def test_sqs_modify_policy_add_statements(self):
+        session_factory = self.replay_flight_data("test_sqs_modify_policy_add_statements")
+        client = session_factory().client("sqs")
+        name = "test_sqs_modify_policy_add_statements"
+        queue_url = client.create_queue(QueueName=name)["QueueUrl"]
+
+        def cleanup():
+            client.delete_queue(QueueUrl=queue_url)
+            if self.recording:
+                time.sleep(60)
+
+        self.addCleanup(cleanup)
+
+        client.set_queue_attributes(
+            QueueUrl=queue_url,
+            Attributes={
+                "Policy": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "SpecificAllow",
+                                "Effect": "Allow",
+                                "Principal": {"AWS": "arn:aws:iam::644160558196:root"},
+                                "Action": ["sqs:Subscribe"],
+                            },
+                        ],
+                    }
+                ),
+            },
+        )
+
+        if self.recording:
+            time.sleep(30)
+
+        p = self.load_policy(
+            {
+                "name": "sqs-set-permissions-add-statements-policy",
+                "resource": "sqs",
+                "filters": [{"QueueUrl": queue_url}],
+                "actions": [
+                    {
+                        "type": "modify-policy",
+                        "add-statements": [
+                            {
+                                "Sid": "AddMe",
+                                "Effect": "Allow",
+                                "Principal": "*",
+                                "Action": ["sqs:GetQueueAttributes"],
+                                "Resource": queue_url
+                            }
+                        ],
+                        "remove-statements": [],
+                    }
+                ],
+            },
+            session_factory=session_factory,
+        )
+
+        resources = p.run()
+        if self.recording:
+            time.sleep(30)
+
+        self.assertEqual(len(resources), 1)
+
+        data = json.loads(
+            client.get_queue_attributes(
+                QueueUrl=resources[0]["QueueUrl"], AttributeNames=["Policy"]
+            )["Attributes"]["Policy"]
+        )
+
+        self.assertTrue("AddMe" in [s["Sid"] for s in data.get("Statement", ())])
+
+    @functional
+    def test_sqs_modify_policy_add_remove_statements(self):
+        session_factory = self.replay_flight_data("test_sqs_modify_policy_add_remove_statements")
+        client = session_factory().client("sqs")
+        name = "test_sqs_modify_policy_add_remove_statements"
+        queue_url = client.create_queue(QueueName=name)["QueueUrl"]
+
+        def cleanup():
+            client.delete_queue(QueueUrl=queue_url)
+            if self.recording:
+                time.sleep(60)
+
+        self.addCleanup(cleanup)
+
+        client.set_queue_attributes(
+            QueueUrl=queue_url,
+            Attributes={
+                "Policy": json.dumps(
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "SpecificAllow",
+                                "Effect": "Allow",
+                                "Principal": {"AWS": "arn:aws:iam::123456789123:root"},
+                                "Action": ["sqs:Subscribe"],
+                            },
+                            {
+                                "Sid": "RemoveMe",
+                                "Effect": "Allow",
+                                "Principal": "*",
+                                "Action": ["sqs:GetQueueAttributes"],
+                            }
+                        ],
+                    }
+                ),
+            },
+        )
+
+        if self.recording:
+            time.sleep(30)
+
+        p = self.load_policy(
+            {
+                "name": "sqs_modify_policy_add_remove_statements",
+                "resource": "sqs",
+                "filters": [{"QueueUrl": queue_url}],
+                "actions": [
+                    {
+                        "type": "modify-policy",
+                        "add-statements": [
+                            {
+                                "Sid": "AddMe",
+                                "Effect": "Allow",
+                                "Principal": "*",
+                                "Action": ["sqs:GetQueueAttributes"],
+                                "Resource": queue_url
+                            }
+                        ],
+                        "remove-statements": ["RemoveMe"],
+                    }
+                ],
+            },
+            session_factory=session_factory,
+        )
+
+        resources = p.run()
+        if self.recording:
+            time.sleep(30)
+
+        self.assertEqual(len(resources), 1)
+
+        data = json.loads(
+            client.get_queue_attributes(
+                QueueUrl=resources[0]["QueueUrl"], AttributeNames=["Policy"]
+            )["Attributes"]["Policy"]
+        )
+
+        statement_ids = {s["Sid"] for s in data.get("Statement", ())}
+        self.assertTrue("AddMe" in statement_ids)
+        self.assertTrue("RemoveMe" not in statement_ids)
+        self.assertTrue("SpecificAllow" in statement_ids)
+
+    @functional
     def test_sqs_mark_for_op(self):
         session_factory = self.replay_flight_data("test_sqs_mark_for_op")
         client = session_factory().client("sqs")
         name = "test-sqs"
         queue_url = client.create_queue(QueueName=name)["QueueUrl"]
         self.addCleanup(client.delete_queue, QueueUrl=queue_url)
+
+        if self.recording:
+            time.sleep(15)
 
         p = self.load_policy(
             {
@@ -290,9 +453,12 @@ class TestSqsAction(BaseTest):
     def test_sqs_tag(self):
         session_factory = self.replay_flight_data("test_sqs_tags")
         client = session_factory().client("sqs")
-        name = "test-sqs"
+        name = "test-sqs-5"
         queue_url = client.create_queue(QueueName=name)["QueueUrl"]
         self.addCleanup(client.delete_queue, QueueUrl=queue_url)
+
+        if self.recording:
+            time.sleep(15)
 
         p = self.load_policy(
             {
@@ -319,12 +485,15 @@ class TestSqsAction(BaseTest):
     def test_sqs_remove_tag(self):
         session_factory = self.replay_flight_data("test_sqs_remove_tag")
         client = session_factory().client("sqs")
-        name = "test-sqs"
+        name = "test-sqs-4"
         queue_url = client.create_queue(QueueName=name)["QueueUrl"]
         client.tag_queue(
             QueueUrl=queue_url, Tags={"remove-this-tag": "tag to be removed"}
         )
         self.addCleanup(client.delete_queue, QueueUrl=queue_url)
+
+        if self.recording:
+            time.sleep(15)
 
         p = self.load_policy(
             {
@@ -413,3 +582,106 @@ class TestSqsAction(BaseTest):
         self.assertEqual(resources[0]["QueueUrl"], url1)
         resources = p.resource_manager.get_resources([url2])
         self.assertEqual(resources[0]["QueueUrl"], url1)
+
+    @functional
+    def test_sqs_kms_alias(self):
+        session_factory = self.replay_flight_data("test_sqs_kms_key_filter")
+
+        p = self.load_policy(
+            {
+                "name": "sqs-kms-alias",
+                "resource": "sqs",
+                "filters": [
+                    {
+                        "or": [
+                            {
+                                "type": "value",
+                                "key": "KmsMasterKeyId",
+                                "value": "^(alias/aws/)",
+                                "op": "regex"
+                            },
+                            {
+                                "type": "kms-key",
+                                "key": "c7n:AliasName",
+                                "value": "^(alias/aws/)",
+                                "op": "regex"
+                            }
+                        ]
+                    }
+                ]
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(2, len(resources))
+        for r in resources:
+            self.assertTrue(r['KmsMasterKeyId'] in [
+                u'alias/aws/sqs',
+                u'arn:aws:kms:us-east-1:644160558196:key/8785aeb9-a616-4e2b-bbd3-df3cde76bcc5'
+            ])
+            self.assertTrue(r['QueueArn'] in [
+                u'arn:aws:sqs:us-east-1:644160558196:sqs-test-alias',
+                u'arn:aws:sqs:us-east-1:644160558196:sqs-test-id'
+            ])
+
+    def test_sqs_post_finding(self):
+        factory = self.replay_flight_data('test_sqs_post_finding')
+        p = self.load_policy({
+            'name': 'sqs',
+            'resource': 'aws.sqs',
+            'actions': [
+                {'type': 'post-finding',
+                 'types': [
+                     'Software and Configuration Checks/OrgStandard/abc-123']}]},
+            session_factory=factory, config={'region': 'us-west-2'})
+        queues = p.resource_manager.get_resources([
+            'test_sqs_modify_policy_add_remove_statements'])
+        post_finding = p.resource_manager.actions[0]
+        rfinding = post_finding.format_resource(queues[0])
+
+        assert rfinding == {'Details': {
+            'AwsSqsQueue': {
+                'KmsDataKeyReusePeriodSeconds': 300,
+                'KmsMasterKeyId': 'alias/aws/sqs',
+                'QueueName': 'test_sqs_modify_policy_add_remove_statements'}},
+            'Id': 'arn:aws:sqs:us-west-2:644160558196:test_sqs_modify_policy_add_remove_statements',
+            'Partition': 'aws',
+            'Region': 'us-west-2',
+            'Type': 'AwsSqsQueue'}
+        shape_validate(
+            rfinding['Details']['AwsSqsQueue'],
+            'AwsSqsQueueDetails',
+            'securityhub',
+        )
+
+    def test_sqs_access_analyzer_parameterized(self):
+        factory = self.replay_flight_data('test_sqs_analyzer_finding')
+        p = self.load_policy({
+            'name': 'check-sqs',
+            'resource': 'aws.sqs',
+            'filters': [
+                {'QueueUrl': 'https://queue.amazonaws.com/644160558196/public-test'},
+                {'type': 'iam-analyzer',
+                 'key': 'analyzedAt',
+                 'value_type': 'age',
+                 'value': 5,
+                 'op': 'gt'},
+            ]
+        }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertIn('c7n:AccessAnalysis', resources[0])
+
+    def test_sqs_access_analyzer(self):
+        factory = self.replay_flight_data('test_sqs_analyzer_finding')
+        p = self.load_policy({
+            'name': 'check-sqs',
+            'resource': 'aws.sqs',
+            'filters': [
+                {'QueueUrl': 'https://queue.amazonaws.com/644160558196/public-test'},
+                {'type': 'iam-analyzer'}
+            ]
+        }, session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertIn('c7n:AccessAnalysis', resources[0])

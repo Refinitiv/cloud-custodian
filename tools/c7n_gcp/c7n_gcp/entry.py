@@ -14,23 +14,19 @@
 
 import logging
 
-import c7n_gcp.policy
-import c7n_gcp.resources.build
-import c7n_gcp.resources.compute
-import c7n_gcp.resources.function
-import c7n_gcp.resources.gke
-import c7n_gcp.resources.logging
-import c7n_gcp.resources.network
-import c7n_gcp.resources.pubsub
-import c7n_gcp.resources.resourcemanager
-import c7n_gcp.resources.service
-import c7n_gcp.resources.source
-import c7n_gcp.resources.storage
-import c7n_gcp.resources.sql  # noqa: F401
+# register provider
+import c7n_gcp.provider # noqa
 
-
+# squelch inconsiderate logging
 logging.getLogger('googleapiclient.discovery').setLevel(logging.WARNING)
 
 
 def initialize_gcp():
-    pass
+    """Load gcp provider"""
+
+    # register execution modes
+    import c7n_gcp.policy # noqa
+
+    # load shared registered resources
+    import c7n_gcp.actions
+    import c7n_gcp.output # noqa

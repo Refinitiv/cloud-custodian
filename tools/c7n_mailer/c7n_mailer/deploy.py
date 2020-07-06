@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import copy
+import logging
 import json
 import os
 
@@ -23,6 +22,8 @@ from c7n.mu import (
     LambdaManager,
     PythonPackageArchive)
 
+
+log = logging.getLogger('custodian-mailer')
 
 entry_source = """\
 import logging
@@ -38,11 +39,24 @@ def dispatch(event, context):
     return handle.start_c7n_mailer(logger)
 """
 
+CORE_DEPS = [
+    # core deps
+    'jinja2', 'markupsafe', 'yaml', 'ldap3', 'pyasn1', 'redis', 'jmespath',
+    # for other dependencies
+    'pkg_resources',
+    # transport datadog - recursive deps
+    'datadog', 'decorator',
+    # requests (recursive deps), needed by datadog, slackclient, splunk
+    'requests', 'urllib3', 'idna', 'chardet', 'certifi',
+    # used by splunk mailer transport
+    'jsonpointer', 'jsonpatch',
+    # sendgrid dependencies
+    'sendgrid', 'python_http_client']
+
 
 def get_archive(config):
-    archive = PythonPackageArchive(
-        'c7n_mailer', 'ldap3', 'pyasn1', 'jinja2', 'markupsafe', 'ruamel',
-        'redis', 'datadog', 'requests')
+    deps = ['c7n_mailer'] + list(CORE_DEPS)
+    archive = PythonPackageArchive(modules=deps)
 
     for d in set(config['templates_folders']):
         if not os.path.exists(d):
@@ -82,5 +96,6 @@ def provision(config, session_factory):
 
     archive = get_archive(config)
     func = LambdaFunction(func_config, archive)
+    log.info("Provisioning mailer lambda %s" % (session_factory().region_name))
     manager = LambdaManager(session_factory)
     manager.publish(func)

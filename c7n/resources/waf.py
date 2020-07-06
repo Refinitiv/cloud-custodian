@@ -11,35 +11,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import ConfigSource, QueryResourceManager, TypeInfo, DescribeSource
+from c7n.tags import universal_augment
+
+
+class DescribeRegionalWaf(DescribeSource):
+    def augment(self, resources):
+        return universal_augment(self.manager, resources)
 
 
 @resources.register('waf')
 class WAF(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "waf"
         enum_spec = ("list_web_acls", "WebACLs", None)
         detail_spec = ("get_web_acl", "WebACLId", "WebACLId", "WebACL")
         name = "Name"
         id = "WebACLId"
         dimension = "WebACL"
-        filter_name = None
-        config_type = "AWS::WAF::WebACL"
+        cfn_type = config_type = "AWS::WAF::WebACL"
+        arn_type = "webacl"
+        # override defaults to casing issues
+        permissions_enum = ('waf:ListWebACLs',)
+        permissions_augment = ('waf:GetWebACL',)
 
 
 @resources.register('waf-regional')
 class RegionalWAF(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "waf-regional"
         enum_spec = ("list_web_acls", "WebACLs", None)
         detail_spec = ("get_web_acl", "WebACLId", "WebACLId", "WebACL")
         name = "Name"
         id = "WebACLId"
         dimension = "WebACL"
-        filter_name = None
-        config_type = "AWS::WAFRegional::WebACL"
+        cfn_type = config_type = "AWS::WAFRegional::WebACL"
+        arn_type = "webacl"
+        # override defaults to casing issues
+        permissions_enum = ('waf-regional:ListWebACLs',)
+        permissions_augment = ('waf-regional:GetWebACL',)
+        universal_taggable = object()
+
+    source_mapping = {
+        'describe': DescribeRegionalWaf,
+        'config': ConfigSource
+    }

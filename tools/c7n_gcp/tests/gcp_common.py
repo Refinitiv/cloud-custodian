@@ -13,22 +13,27 @@
 # limitations under the License.
 
 import functools
+import json
 import os
 import shutil
 
 from c7n.testing import TestUtils
 from c7n.schema import generate
-from c7n.resources import load_resources
-
 from c7n_gcp.client import Session, LOCAL_THREAD
 
 from recorder import HttpRecorder, HttpReplay
 
-load_resources()
 
 PROJECT_ID = ""
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data', 'flights')
+
+EVENT_DIR = os.path.join(os.path.dirname(__file__), 'data', 'events')
+
+
+def event_data(fname):
+    with open(os.path.join(EVENT_DIR, fname)) as fh:
+        return json.load(fh)
 
 
 class FlightRecorderTest(TestUtils):

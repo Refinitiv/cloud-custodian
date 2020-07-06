@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
 from .core import ValueFilter
 from .related import RelatedResourceFilter
@@ -21,7 +19,7 @@ from c7n.utils import local_session, type_schema
 
 class KmsRelatedFilter(RelatedResourceFilter):
     """
-    Filter a resource by its associcated kms key and optionally the aliasname
+    Filter a resource by its associated kms key and optionally the aliasname
     of the kms key by using 'c7n:AliasName'
 
     :example:
@@ -29,7 +27,7 @@ class KmsRelatedFilter(RelatedResourceFilter):
         .. code-block:: yaml
 
             policies:
-                - name:
+                - name: dms-encrypt-key-check
                   resource: dms-instance
                   filters:
                     - type: kms-key
@@ -43,6 +41,16 @@ class KmsRelatedFilter(RelatedResourceFilter):
            'operator': {'enum': ['and', 'or']}})
     RelatedResource = "c7n.resources.kms.Key"
     AnnotationKey = "matched-kms-key"
+
+    def get_related_ids(self, resources):
+        related_ids = super().get_related_ids(resources)
+        normalized_ids = []
+        for rid in related_ids:
+            if rid.startswith('arn:'):
+                normalized_ids.append(rid.rsplit('/', 1)[-1])
+            else:
+                normalized_ids.append(rid)
+        return normalized_ids
 
     def process(self, resources, event=None):
         client = local_session(self.manager.session_factory).client('kms')

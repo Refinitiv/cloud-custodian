@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import json
 
 from .common import BaseTest, functional
+from c7n.resources.aws import shape_validate
+from c7n.utils import yaml_load
 
 
 class TestSNS(BaseTest):
@@ -525,7 +525,7 @@ class TestSNS(BaseTest):
             session_factory=session_factory
         )
         resources = p.run()
-        self.assertEquals(len(resources), 1)
+        self.assertEqual(len(resources), 1)
         sns = session_factory().client('sns')
         attributes = sns.get_topic_attributes(TopicArn=topic)
         self.assertTrue(attributes['Attributes']['KmsMasterKeyId'], 'alias/aws/sns')
@@ -590,6 +590,152 @@ class TestSNS(BaseTest):
             session_factory=session_factory
         )
         resources = p.run()
-        self.assertEquals(len(resources), 1)
+        self.assertEqual(len(resources), 1)
         attributes = sns.get_topic_attributes(TopicArn=topic)['Attributes']
         self.assertEqual(attributes.get('KmsMasterKeyId'), key_alias)
+
+    def test_sns_delete(self):
+        session_factory = self.replay_flight_data('test_sns_delete_topic')
+        policy = """
+        name: delete-sns
+        resource: aws.sns
+        filters:
+          - TopicArn: arn:aws:sns:us-west-1:644160558196:test
+        actions:
+          - type: delete
+        """
+        p = self.load_policy(yaml_load(policy), session_factory=session_factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        client = session_factory().client('sns')
+        resources = client.list_topics()['Topics']
+        self.assertEqual(len(resources), 0)
+
+    def test_sns_tag(self):
+        session_factory = self.replay_flight_data("test_sns_tag")
+        p = self.load_policy(
+            {
+                "name": "tag-sns",
+                "resource": "sns",
+                "filters": [{"tag:Tagging": "absent"}],
+                "actions": [{"type": "tag", "key": "Tagging", "value": "added"}],
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        client = session_factory().client("sns")
+        tags = client.list_tags_for_resource(ResourceArn=resources[0]["TopicArn"])["Tags"]
+        self.assertEqual(tags[0]["Value"], "added")
+
+    def test_sns_remove_tag(self):
+        session_factory = self.replay_flight_data(
+            "test_sns_remove_tag")
+        p = self.load_policy(
+            {
+                "name": "untag-sns",
+                "resource": "sns",
+                "filters": [
+                    {
+                        "type": "marked-for-op",
+                        "tag": "custodian_cleanup",
+                        "op": "delete",
+                    }
+                ],
+                "actions": [{"type": "remove-tag", "tags": ["custodian_cleanup"]}],
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+
+        client = session_factory().client("sns")
+        tags = client.list_tags_for_resource(ResourceArn=resources[0]["TopicArn"])["Tags"]
+        self.assertEqual(len(tags), 0)
+
+    def test_sns_mark_for_op(self):
+        session_factory = self.replay_flight_data(
+            "test_sns_mark_for_op"
+        )
+        p = self.load_policy(
+            {
+                "name": "sns-untagged-delete",
+                "resource": "sns",
+                "filters": [
+                    {"tag:Tagging": "absent"},
+                    {"tag:custodian_cleanup": "absent"},
+                ],
+                "actions": [
+                    {
+                        "type": "mark-for-op",
+                        "tag": "custodian_cleanup",
+                        "op": "delete",
+                        "days": 1,
+                    }
+                ],
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        client = session_factory().client("sns")
+        tags = client.list_tags_for_resource(ResourceArn=resources[0]["TopicArn"])["Tags"]
+        self.assertTrue(tags[0]["Key"], "custodian_cleanup")
+
+    def test_sns_post_finding(self):
+        factory = self.replay_flight_data('test_sns_post_finding')
+        p = self.load_policy({
+            'name': 'sns',
+            'resource': 'aws.sns',
+            'actions': [
+                {'type': 'post-finding',
+                 'types': [
+                     'Software and Configuration Checks/OrgStandard/abc-123']}]},
+            session_factory=factory, config={'region': 'us-west-2'})
+        resources = p.resource_manager.get_resources([
+            'arn:aws:sns:us-west-2:644160558196:config-topic'])
+        rfinding = p.resource_manager.actions[0].format_resource(
+            resources[0])
+        self.assertEqual(
+            rfinding,
+            {'Details': {'AwsSnsTopic': {
+                'Owner': '644160558196',
+                'TopicName': 'config-topic'}},
+             'Id': 'arn:aws:sns:us-west-2:644160558196:config-topic',
+             'Partition': 'aws',
+             'Region': 'us-west-2',
+             'Type': 'AwsSnsTopic'})
+        shape_validate(
+            rfinding['Details']['AwsSnsTopic'],
+            'AwsSnsTopicDetails', 'securityhub')
+
+
+class TestSubscription(BaseTest):
+
+    def test_subscription_delete(self):
+        factory = self.replay_flight_data("test_subscription_delete")
+
+        p = self.load_policy(
+            {
+                "name": "external-owner-delete",
+                "resource": "sns-subscription",
+                "filters": [
+                    {
+                        "type": "value",
+                        "key": "Owner",
+                        "value": "123456789099",
+                        "op": "ne",
+                    }
+                ],
+                "actions": [{"type": "delete"}],
+            },
+            session_factory=factory,
+        )
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertNotEqual(resources[0]["Owner"], "123456789099")
+        client = factory().client("sns")
+        subs = client.list_subscriptions()
+        for s in subs.get("Subscriptions", []):
+            self.assertTrue("123456789099" == s.get("Owner"))

@@ -14,33 +14,26 @@
 
 import logging
 
-from botocore.exceptions import ClientError
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n import utils
 from c7n import tags
-from c7n.utils import get_retry, local_session, type_schema
-from c7n.actions import ActionRegistry, BaseAction
-from c7n.filters import FilterRegistry
+from c7n.utils import local_session, type_schema
+from c7n.actions import BaseAction
 
 log = logging.getLogger('custodian.elasticbeanstalk')
-
-env_filters = FilterRegistry('elasticbeanstalk-environment.filters')
-env_actions = ActionRegistry('elasticbeanstalk-environment.actions')
-
-env_filters.register('tag-count', tags.TagCountFilter)
-env_filters.register('marked-for-op', tags.TagActionFilter)
 
 
 @resources.register('elasticbeanstalk')
 class ElasticBeanstalk(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'elasticbeanstalk'
         enum_spec = ('describe_applications', 'Applications', None)
         name = "ApplicationName"
         id = "ApplicationName"
-        dimension = None
+        arn = "ApplicationArn"
+        arn_type = 'application'
         default_report_fields = (
             'ApplicationName',
             'DateCreated',
@@ -48,6 +41,13 @@ class ElasticBeanstalk(QueryResourceManager):
         )
         filter_name = 'ApplicationNames'
         filter_type = 'list'
+        cfn_type = config_type = 'AWS::ElasticBeanstalk::Application'
+
+
+class DescribeEnvironment(DescribeSource):
+
+    def augment(self, resources):
+        return _eb_env_tags(resources, self.manager.session_factory, self.manager.retry)
 
 
 @resources.register('elasticbeanstalk-environment')
@@ -55,11 +55,12 @@ class ElasticBeanstalkEnvironment(QueryResourceManager):
     """ Resource manager for Elasticbeanstalk Environments
     """
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'elasticbeanstalk'
         enum_spec = ('describe_environments', 'Environments', None)
         name = id = "EnvironmentName"
-        dimension = None
+        arn = "EnvironmentArn"
+        arn_type = 'environment'
         default_report_fields = (
             'EnvironmentName',
             'DateCreated',
@@ -67,46 +68,41 @@ class ElasticBeanstalkEnvironment(QueryResourceManager):
         )
         filter_name = 'EnvironmentNames'
         filter_type = 'list'
+        cfn_type = config_type = 'AWS::ElasticBeanstalk::Environment'
 
-    filter_registry = env_filters
-    action_registry = env_actions
-    retry = staticmethod(get_retry(('ThrottlingException',)))
     permissions = ('elasticbeanstalk:ListTagsForResource',)
-
-    def augment(self, envs):
-        filter(None, _eb_env_tags(
-            envs, self.session_factory, self.executor_factory, self.retry
-        ))
-        return envs
+    source_mapping = {
+        'describe': DescribeEnvironment,
+        'config': ConfigSource
+    }
 
 
-def _eb_env_tags(envs, session_factory, executor_factory, retry):
+ElasticBeanstalkEnvironment.filter_registry.register(
+    'tag-count', tags.TagCountFilter)
+ElasticBeanstalkEnvironment.filter_registry.register(
+    'marked-for-op', tags.TagActionFilter)
+
+
+def _eb_env_tags(envs, session_factory, retry):
     """Augment ElasticBeanstalk Environments with their tags."""
 
+    client = local_session(session_factory).client('elasticbeanstalk')
+
     def process_tags(eb_env):
-        client = local_session(session_factory).client('elasticbeanstalk')
         try:
-            tag_list = retry(
+            eb_env['Tags'] = retry(
                 client.list_tags_for_resource,
-                ResourceArn=eb_env['EnvironmentArn']
-            )['ResourceTags']
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'ResourceNotFoundException':
-                log.warning(
-                    "Exception getting elasticbeanstalk-environment tags for "
-                    "environment name: %s\n %s", eb_env['EnvironmentName'], e
-                )
-            return None
-        eb_env['Tags'] = tag_list
+                ResourceArn=eb_env['EnvironmentArn'])['ResourceTags']
+        except client.exceptions.ResourceNotFoundException:
+            return
         return eb_env
 
     # Handle API rate-limiting, which is a problem for accounts with many
     # EB Environments
-    with executor_factory(max_workers=1) as w:
-        return list(w.map(process_tags, envs))
+    return list(map(process_tags, envs))
 
 
-@env_actions.register('mark-for-op')
+@ElasticBeanstalkEnvironment.action_registry.register('mark-for-op')
 class TagDelayedAction(tags.TagDelayedAction):
     """Mark an ElasticBeanstalk Environment for specific custodian action
 
@@ -118,7 +114,7 @@ class TagDelayedAction(tags.TagDelayedAction):
     .. code-block:: yaml
 
             policies:
-              - name: mark-for-delete
+              - name: eb-mark-for-delete
                 resource: elasticbeanstalk-environment
                 filters:
                   - type: value
@@ -130,26 +126,9 @@ class TagDelayedAction(tags.TagDelayedAction):
                     op: terminate
                     days: 7
     """
-    schema = type_schema('mark-for-op', rinherit=tags.TagDelayedAction.schema)
-    permissions = ('elasticbeanstalk:UpdateTagsForResource',)
-
-    batch_size = 5
-
-    def process(self, envs):
-        return super(TagDelayedAction, self).process(envs)
-
-    def process_resource_set(self, envs, tags):
-        client = local_session(
-            self.manager.session_factory
-        ).client('elasticbeanstalk')
-        for env in envs:
-            client.update_tags_for_resource(
-                ResourceArn=env['EnvironmentArn'],
-                TagsToAdd=tags
-            )
 
 
-@env_actions.register('tag')
+@ElasticBeanstalkEnvironment.action_registry.register('tag')
 class Tag(tags.Tag):
     """Tag an ElasticBeanstalk Environment with a key/value
 
@@ -172,20 +151,16 @@ class Tag(tags.Tag):
     """
 
     batch_size = 5
-    permissions = ('elasticbeanstalk:UpdateTagsForResource',)
+    permissions = ('elasticbeanstalk:AddTags',)
 
-    def process_resource_set(self, envs, ts):
-        client = local_session(
-            self.manager.session_factory
-        ).client('elasticbeanstalk')
+    def process_resource_set(self, client, envs, ts):
         for env in envs:
             client.update_tags_for_resource(
                 ResourceArn=env['EnvironmentArn'],
-                TagsToAdd=ts
-            )
+                TagsToAdd=ts)
 
 
-@env_actions.register('remove-tag')
+@ElasticBeanstalkEnvironment.action_registry.register('remove-tag')
 class RemoveTag(tags.RemoveTag):
     """Removes a tag or set of tags from ElasticBeanstalk Environments
 
@@ -207,20 +182,16 @@ class RemoveTag(tags.RemoveTag):
     """
 
     batch_size = 5
-    permissions = ('elasticbeanstalk:UpdateTagsForResource',)
+    permissions = ('elasticbeanstalk:RemoveTags',)
 
-    def process_resource_set(self, envs, tag_keys):
-        client = local_session(
-            self.manager.session_factory
-        ).client('elasticbeanstalk')
+    def process_resource_set(self, client, envs, tag_keys):
         for env in envs:
             client.update_tags_for_resource(
                 ResourceArn=env['EnvironmentArn'],
-                TagsToRemove=tag_keys
-            )
+                TagsToRemove=tag_keys)
 
 
-@env_actions.register('terminate')
+@ElasticBeanstalkEnvironment.action_registry.register('terminate')
 class Terminate(BaseAction):
     """ Terminate an ElasticBeanstalk Environment.
 

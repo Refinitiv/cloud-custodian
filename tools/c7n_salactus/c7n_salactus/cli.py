@@ -13,8 +13,6 @@
 # limitations under the License.
 """Salactus, eater of s3 buckets.
 """
-from __future__ import print_function
-
 from collections import Counter
 import csv
 from datetime import datetime
@@ -281,7 +279,7 @@ def format_accounts_csv(accounts, fh):
                    'size', 'bucket_count']
 
     totals = Counter()
-    skip = set(('name', 'percent_scanned'))
+    skip = {'name', 'percent_scanned'}
     for a in accounts:
         for n in field_names:
             if n in skip:
@@ -410,7 +408,7 @@ def format_csv(buckets, fh, keys=()):
         field_names.insert(0, k)
 
     totals = Counter()
-    skip = set(('account', 'name', 'region', 'percent', 'created', 'inventory'))
+    skip = {'account', 'name', 'region', 'percent', 'created', 'inventory'}
     skip.update(keys)
 
     for b in buckets:
@@ -691,7 +689,7 @@ def inspect_queue(queue, state, limit, bucket):
     conn = worker.connection
 
     def job_row(j):
-        if isinstance(j.args[0], basestring):
+        if isinstance(j.args[0], basestring):  # noqa: F821
             account, bucket = j.args[0].split(':', 1)
         elif isinstance(j.args[0], dict):
             account, bucket = j.args[0]['name'], "set %d" % len(j.args[1])

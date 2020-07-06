@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import io
 import json
 import os
 import tempfile
 import mock
+from urllib.parse import quote_plus
 
 from unittest import TestCase
 
 from c7n.resources import s3
 from c7n.ufuncs import s3crypt
 from .common import BaseTest
-from six.moves.urllib_parse import quote_plus
 
 
 class TestS3Crypt(TestCase):

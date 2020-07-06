@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 # PYTHON_ARGCOMPLETE_OK  (Must be in first 1024 bytes, so if tab completion
 # is failing, move this above the license)
 
@@ -33,7 +31,6 @@ except ImportError:
     def setproctitle(t):
         return None
 
-from c7n.commands import schema_completer
 from c7n.config import Config
 
 DEFAULT_REGION = 'us-east-1'
@@ -69,9 +66,10 @@ def _default_options(p, blacklist=""):
     config.add_argument("-c", "--config", help=argparse.SUPPRESS)
     config.add_argument("configs", nargs='*',
                         help="Policy configuration file(s)")
-    config.add_argument("-p", "--policies", default=None, dest='policy_filter',
-                        help="Only use named/matched policies")
-    config.add_argument("-t", "--resource", default=None, dest='resource_type',
+    config.add_argument("-p", "--policies", default=[], dest='policy_filters',
+                        action='append', help="Only use named/matched policies")
+    config.add_argument("-t", "--resource", default=[], dest='resource_types',
+                        action='append',
                         help="Only use policies with the given resource type")
 
     output = p.add_argument_group("output", "Output control")
@@ -92,7 +90,7 @@ def _default_options(p, blacklist=""):
     if 'log-group' not in blacklist:
         p.add_argument(
             "-l", "--log-group", default=None,
-            help="Cloudwatch Log Group to send policy logs")
+            help="Location to send policy logs (Ex: AWS CloudWatch Log Group)")
     else:
         p.add_argument("--log-group", default=None, help=argparse.SUPPRESS)
 
@@ -118,7 +116,7 @@ def _report_options(p):
         '--days', type=float, default=1,
         help="Number of days of history to consider")
     p.add_argument(
-        '--raw', type=argparse.FileType('wb'),
+        '--raw', type=argparse.FileType('w'),
         help="Store raw json of collected records to given file path")
     p.add_argument(
         '--field', action='append', default=[], type=_key_val_pair,
@@ -130,9 +128,9 @@ def _report_options(p):
         '--no-default-fields', action="store_true",
         help='Exclude default fields for report.')
     p.add_argument(
-        '--format', default='csv', choices=['csv', 'grid', 'simple'],
+        '--format', default='csv', choices=['csv', 'grid', 'simple', 'json'],
         help="Format to output data in (default: %(default)s). "
-        "Options include simple, grid, csv")
+        "Options include simple, grid, csv, json")
 
 
 def _metrics_options(p):
@@ -167,24 +165,18 @@ def _logs_options(p):
     )
 
 
-def _schema_tab_completer(prefix, parsed_args, **kwargs):
-    # If we are printing the summary we discard the resource
-    if parsed_args.summary:
-        return []
-
-    return schema_completer(prefix)
-
-
 def _schema_options(p):
     """ Add options specific to schema subcommand. """
 
     p.add_argument(
-        'resource', metavar='selector', nargs='?',
-        default=None).completer = _schema_tab_completer
+        'resource', metavar='selector', nargs='?', default=None)
     p.add_argument(
         '--summary', action="store_true",
         help="Summarize counts of available resources, actions and filters")
-    p.add_argument('--json', action="store_true", help=argparse.SUPPRESS)
+    p.add_argument('--json', action="store_true",
+        help="Export custodian's jsonschema")
+    p.add_argument('--outline', action="store_true",
+        help="Print outline of all resources and their actions and filters")
     p.add_argument("-v", "--verbose", action="count", help="Verbose logging")
     p.add_argument("-q", "--quiet", action="count", help=argparse.SUPPRESS)
     p.add_argument("--debug", default=False, help=argparse.SUPPRESS)
@@ -192,7 +184,7 @@ def _schema_options(p):
 
 def _dryrun_option(p):
     p.add_argument(
-        "-d", "--dryrun", action="store_true",
+        "-d", "--dryrun", "--dry-run", action="store_true",
         help="Don't execute actions but filter resources")
 
 
@@ -207,29 +199,79 @@ def _key_val_pair(value):
 
 
 def setup_parser():
-    c7n_desc = "Cloud fleet management"
+    c7n_desc = "Cloud Custodian - Cloud fleet management"
     parser = argparse.ArgumentParser(description=c7n_desc)
 
     # Setting `dest` means we capture which subparser was used.
-    subs = parser.add_subparsers(dest='subparser')
+    subs = parser.add_subparsers(
+        title='commands',
+        dest='subparser')
+
+    run_desc = "\n".join((
+        "Execute the policies in a config file.",
+        "",
+        "Multiple regions can be passed in, as can the symbolic region 'all'. ",
+        "",
+        "When running across multiple regions, policies targeting resources in ",
+        "regions where they do not exist will not be run. The output directory ",
+        "when passing multiple regions is suffixed with the region. Resources ",
+        "with global endpoints are run just once and are suffixed with the first ",
+        "region passed in or us-east-1 if running against 'all' regions.",
+        ""
+    ))
+
+    run = subs.add_parser(
+        "run", description=run_desc,
+        help="Execute the policies in a config file",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    run.set_defaults(command="c7n.commands.run")
+    _default_options(run)
+    _dryrun_option(run)
+    run.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skips validation of policies (assumes you've run the validate command seperately).")
+
+    metrics_help = ("Emit metrics to provider metrics. Specify 'aws', 'gcp', or 'azure'. "
+            "For more details on aws metrics options, see: "
+            "https://cloudcustodian.io/docs/aws/usage.html#metrics")
+
+    run.add_argument(
+        "-m", "--metrics-enabled",
+        default=None, nargs="?", const="aws",
+        help=metrics_help)
+    run.add_argument(
+        "--trace",
+        dest="tracer",
+        help="Tracing integration",
+        default=None, nargs="?", const="default")
+
+    schema_desc = ("Browse the available vocabularies (resources, filters, modes, and "
+                   "actions) for policy construction. The selector "
+                   "is specified with RESOURCE[.CATEGORY[.ITEM]] "
+                   "examples: s3, ebs.actions, or ec2.filters.instance-age")
+    schema = subs.add_parser(
+        'schema', description=schema_desc,
+        help="Interactive cli docs for policy authors")
+    schema.set_defaults(command="c7n.commands.schema_cmd")
+    _schema_options(schema)
 
     report_desc = ("Report of resources that a policy matched/ran on. "
                    "The default output format is csv, but other formats "
                    "are available.")
     report = subs.add_parser(
-        "report", description=report_desc, help=report_desc)
+        "report", description=report_desc,
+        help="Tabular report on policy matched resources")
     report.set_defaults(command="c7n.commands.report")
     _report_options(report)
 
-    logs_desc = "Get policy execution logs from s3 or cloud watch logs"
     logs = subs.add_parser(
-        'logs', help=logs_desc, description=logs_desc)
+        'logs')
     logs.set_defaults(command="c7n.commands.logs")
     _logs_options(logs)
 
-    metrics_desc = "Retrieve metrics for policies from CloudWatch Metrics"
-    metrics = subs.add_parser(
-        'metrics', description=metrics_desc, help=metrics_desc)
+    metrics = subs.add_parser('metrics')
     metrics.set_defaults(command="c7n.commands.metrics_cmd")
     _metrics_options(metrics)
 
@@ -254,50 +296,6 @@ def setup_parser():
     validate.add_argument("-v", "--verbose", action="count", help="Verbose Logging")
     validate.add_argument("-q", "--quiet", action="count", help="Less logging (repeatable)")
     validate.add_argument("--debug", default=False, help=argparse.SUPPRESS)
-
-    schema_desc = ("Browse the available vocabularies (resources, filters, and "
-                   "actions) for policy construction. The selector "
-                   "is specified with RESOURCE[.CATEGORY[.ITEM]] "
-                   "examples: s3, ebs.actions, or ec2.filters.instance-age")
-    schema = subs.add_parser(
-        'schema', description=schema_desc,
-        help="Interactive cli docs for policy authors")
-    schema.set_defaults(command="c7n.commands.schema_cmd")
-    _schema_options(schema)
-
-    run_desc = "\n".join((
-        "Execute the policies in a config file",
-        "",
-        "Multiple regions can be passed in, as can the symbolic region 'all'. ",
-        "",
-        "When running across multiple regions, policies targeting resources in ",
-        "regions where they do not exist will not be run. The output directory ",
-        "when passing multiple regions is suffixed with the region. Resources ",
-        "with global endpoints are run just once and are suffixed with the first ",
-        "region passed in or us-east-1 if running against 'all' regions.",
-        ""
-    ))
-
-    run = subs.add_parser(
-        "run", description=run_desc, help=run_desc,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-
-    run.set_defaults(command="c7n.commands.run")
-    _default_options(run)
-    _dryrun_option(run)
-    run.add_argument(
-        "--skip-validation",
-        action="store_true",
-        help="Skips validation of policies (assumes you've run the validate command seperately).")
-    run.add_argument(
-        "-m", "--metrics-enabled",
-        default=None, nargs="?", const="aws",
-        help="Emit metrics to provider metrics")
-    run.add_argument(
-        "--trace",
-        dest="tracer",
-        help=argparse.SUPPRESS,
-        default=None, nargs="?", const="default")
 
     return parser
 

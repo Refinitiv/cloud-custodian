@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from .core import (
     ANNOTATION_KEY,
     FilterValidationError,
@@ -21,11 +19,13 @@ from .core import (
     Filter,
     Or,
     And,
+    Not,
     ValueFilter,
     AgeFilter,
-    EventFilter)
+    EventFilter,)
 from .config import ConfigCompliance
 from .health import HealthEventFilter
 from .iamaccess import CrossAccountAccessFilter, PolicyChecker
+from .iamanalyzer import AccessAnalyzer
 from .metrics import MetricsFilter, ShieldMetrics
 from .vpc import DefaultVpcBase

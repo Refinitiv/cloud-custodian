@@ -12,33 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import six
-from c7n_azure.actions import Tag, AutoTagUser, RemoveTag, TagTrim, TagDelayedAction, DeleteAction
-from c7n_azure.filters import (MetricFilter, TagActionFilter,
-                               DiagnosticSettingsFilter, PolicyCompliantFilter)
+from c7n_azure.actions.delete import DeleteAction
+from c7n_azure.actions.lock import LockAction
+from c7n_azure.actions.tagging import (AutoTagDate)
+from c7n_azure.actions.tagging import Tag, AutoTagUser, RemoveTag, TagTrim, TagDelayedAction
+from c7n_azure.filters import (CostFilter, MetricFilter, TagActionFilter,
+                               DiagnosticSettingsFilter, PolicyCompliantFilter, ResourceLockFilter,
+                               AzureOffHour, AzureOnHour)
 from c7n_azure.provider import resources
-from c7n_azure.query import QueryResourceManager, QueryMeta
+from c7n_azure.query import QueryResourceManager, QueryMeta, ChildResourceManager, TypeInfo, \
+    ChildTypeInfo, TypeMeta
 from c7n_azure.utils import ResourceIdParser
 
-from c7n.utils import local_session
+arm_resource_types = {}
 
 
-@resources.register('armresource')
-@six.add_metaclass(QueryMeta)
-class ArmResourceManager(QueryResourceManager):
+class ArmTypeInfo(TypeInfo, metaclass=TypeMeta):
+    # api client construction information for ARM resources
+    id = 'id'
+    name = 'name'
+    diagnostic_settings_enabled = True
+    default_report_fields = (
+        'name',
+        'location',
+        'resourceGroup'
+    )
+    resource_type = None
+    enable_tag_operations = True
 
-    class resource_type(object):
+
+class ArmResourceManager(QueryResourceManager, metaclass=QueryMeta):
+    class resource_type(ArmTypeInfo):
         service = 'azure.mgmt.resource'
         client = 'ResourceManagementClient'
         enum_spec = ('resources', 'list', None)
-        id = 'id'
-        name = 'name'
-        diagnostic_settings_enabled = True
-        default_report_fields = (
-            'name',
-            'location',
-            'resourceGroup'
-        )
 
     def augment(self, resources):
         for resource in resources:
@@ -48,33 +55,53 @@ class ArmResourceManager(QueryResourceManager):
 
     def get_resources(self, resource_ids):
         resource_client = self.get_client('azure.mgmt.resource.ResourceManagementClient')
-        session = local_session(self.session_factory)
         data = [
-            resource_client.resources.get_by_id(rid, session.resource_api_version(rid))
+            resource_client.resources.get_by_id(rid, self._session.resource_api_version(rid))
             for rid in resource_ids
         ]
-        return [r.serialize(True) for r in data]
+        return self.augment([r.serialize(True) for r in data])
+
+    def tag_operation_enabled(self, resource_type):
+        return self.resource_type.enable_tag_operations
 
     @staticmethod
-    def register_arm_specific(registry, _):
-        for resource in registry.keys():
-            klass = registry.get(resource)
-            if issubclass(klass, ArmResourceManager):
-                klass.action_registry.register('tag', Tag)
-                klass.action_registry.register('untag', RemoveTag)
-                klass.action_registry.register('auto-tag-user', AutoTagUser)
-                klass.action_registry.register('tag-trim', TagTrim)
-                klass.filter_registry.register('metric', MetricFilter)
-                klass.filter_registry.register('marked-for-op', TagActionFilter)
-                klass.action_registry.register('mark-for-op', TagDelayedAction)
-                klass.filter_registry.register('policy-compliant', PolicyCompliantFilter)
+    def register_arm_specific(registry, resource_class):
 
-                if resource is not 'resourcegroup':
-                    klass.action_registry.register('delete', DeleteAction)
+        if not issubclass(resource_class, ArmResourceManager):
+            return
 
-                if hasattr(klass.resource_type, 'diagnostic_settings_enabled') \
-                        and klass.resource_type.diagnostic_settings_enabled:
-                    klass.filter_registry.register('diagnostic-settings', DiagnosticSettingsFilter)
+        arm_resource_types[
+            resource_class.resource_type.resource_type.lower()] = resource_class.resource_type
+
+        if resource_class.resource_type.enable_tag_operations:
+            resource_class.action_registry.register('tag', Tag)
+            resource_class.action_registry.register('untag', RemoveTag)
+            resource_class.action_registry.register('auto-tag-user', AutoTagUser)
+            resource_class.action_registry.register('auto-tag-date', AutoTagDate)
+            resource_class.action_registry.register('tag-trim', TagTrim)
+            resource_class.filter_registry.register('marked-for-op', TagActionFilter)
+            resource_class.action_registry.register('mark-for-op', TagDelayedAction)
+
+        if resource_class.type != 'armresource':
+            resource_class.filter_registry.register('cost', CostFilter)
+
+        resource_class.filter_registry.register('metric', MetricFilter)
+        resource_class.filter_registry.register('policy-compliant', PolicyCompliantFilter)
+        resource_class.filter_registry.register('resource-lock', ResourceLockFilter)
+        resource_class.action_registry.register('lock', LockAction)
+        resource_class.filter_registry.register('offhour', AzureOffHour)
+        resource_class.filter_registry.register('onhour', AzureOnHour)
+
+        resource_class.action_registry.register('delete', DeleteAction)
+
+        if resource_class.resource_type.diagnostic_settings_enabled:
+            resource_class.filter_registry.register('diagnostic-settings', DiagnosticSettingsFilter)
 
 
-resources.subscribe(resources.EVENT_FINAL, ArmResourceManager.register_arm_specific)
+class ChildArmResourceManager(ChildResourceManager, ArmResourceManager, metaclass=QueryMeta):
+
+    class resource_type(ChildTypeInfo, ArmTypeInfo):
+        pass
+
+
+resources.subscribe(ArmResourceManager.register_arm_specific)

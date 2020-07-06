@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
-
 import click
-import yaml
 import os
 from c7n.credentials import assumed_session, SessionFactory
+from c7n.utils import yaml_dump
 
 ROLE_TEMPLATE = "arn:aws:iam::{Id}:role/OrganizationAccountAccessRole"
 
@@ -37,7 +35,9 @@ ROLE_TEMPLATE = "arn:aws:iam::{Id}:role/OrganizationAccountAccessRole"
     '-f', '--output', type=click.File('w'),
     help="File to store the generated config (default stdout)")
 @click.option('-a', '--active', default=False, help="Get only active accounts", type=click.BOOL)
-def main(role, ou, assume, profile, output, regions, active):
+@click.option('-i', '--ignore', multiple=True,
+  help="list of accounts that won't be added to the config file")
+def main(role, ou, assume, profile, output, regions, active, ignore):
     """Generate a c7n-org accounts config file using AWS Organizations
 
     With c7n-org you can then run policies or arbitrary scripts across
@@ -49,7 +49,7 @@ def main(role, ou, assume, profile, output, regions, active):
     accounts = []
     for path in ou:
         ou = get_ou_from_path(client, path)
-        accounts.extend(get_accounts_for_ou(client, ou, active))
+        accounts.extend(get_accounts_for_ou(client, ou, active, ignoredAccounts=ignore))
 
     results = []
     for a in accounts:
@@ -58,6 +58,9 @@ def main(role, ou, assume, profile, output, regions, active):
         for idx, _ in enumerate(path_parts):
             tags.append("path:/%s" % "/".join(path_parts[:idx + 1]))
 
+        for tag in list_tags_for_account(client, a['Id']):
+            tags.append("{}:{}".format(tag.get('Key'), tag.get('Value')))
+
         ainfo = {
             'account_id': a['Id'],
             'email': a['Email'],
@@ -65,14 +68,10 @@ def main(role, ou, assume, profile, output, regions, active):
             'tags': tags,
             'role': role.format(**a)}
         if regions:
-            ainfo['regions'] = regions
+            ainfo['regions'] = list(regions)
         results.append(ainfo)
 
-    print(
-        yaml.safe_dump(
-            {'accounts': results},
-            default_flow_style=False),
-        file=output)
+    print(yaml_dump({'accounts': results}), file=output)
 
 
 def get_session(role, session_name, profile):
@@ -120,7 +119,7 @@ def get_sub_ous(client, ou):
     return results
 
 
-def get_accounts_for_ou(client, ou, active, recursive=True):
+def get_accounts_for_ou(client, ou, active, recursive=True, ignoredAccounts=()):
     results = []
     ous = [ou]
     if recursive:
@@ -132,11 +131,26 @@ def get_accounts_for_ou(client, ou, active, recursive=True):
             ParentId=ou['Id']).build_full_result().get(
                 'Accounts', []):
             a['Path'] = ou['Path']
+
+            if a['Id'] in ignoredAccounts:
+                continue
+
             if active:
                 if a['Status'] == 'ACTIVE':
                     results.append(a)
             else:
                 results.append(a)
+    return results
+
+
+def list_tags_for_account(client, id):
+    results = []
+
+    tags_pager = client.get_paginator('list_tags_for_resource')
+    for tag in tags_pager.paginate(
+        ResourceId=id).build_full_result().get(
+            'Tags', []):
+        results.append(tag)
     return results
 
 

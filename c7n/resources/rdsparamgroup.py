@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import logging
 
 from botocore.exceptions import ClientError
@@ -20,7 +18,7 @@ from botocore.exceptions import ClientError
 from c7n.actions import ActionRegistry, BaseAction
 from c7n.filters import FilterRegistry
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import (type_schema, local_session, chunks)
 
 log = logging.getLogger('custodian.rds-param-group')
@@ -34,16 +32,15 @@ class RDSParamGroup(QueryResourceManager):
     """Resource manager for RDS parameter groups.
     """
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
 
         service = 'rds'
-        type = 'pg'
+        arn_type = 'pg'
         enum_spec = ('describe_db_parameter_groups', 'DBParameterGroups', None)
         name = id = 'DBParameterGroupName'
-        filter_name = None
-        filter_type = None
         dimension = 'DBParameterGroupName'
-        date = None
+        permissions_enum = ('rds:DescribeDBParameterGroups',)
+        cfn_type = 'AWS::RDS::DBParameterGroup'
 
     filter_registry = pg_filters
     action_registry = pg_actions
@@ -58,28 +55,27 @@ class RDSClusterParamGroup(QueryResourceManager):
     """ Resource manager for RDS cluster parameter groups.
     """
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
 
         service = 'rds'
-        type = 'cluster-pg'
+        arn_type = 'cluster-pg'
         enum_spec = ('describe_db_cluster_parameter_groups', 'DBClusterParameterGroups', None)
         name = id = 'DBClusterParameterGroupName'
-        filter_name = None
-        filter_type = None
         dimension = 'DBClusterParameterGroupName'
-        date = None
+        permissions_enum = ('rds:DescribeDBClusterParameterGroups',)
+        cfn_type = 'AWS::RDS::DBClusterParameterGroup'
 
     filter_registry = pg_cluster_filters
     action_registry = pg_cluster_actions
 
 
-class PGMixin(object):
+class PGMixin:
 
     def get_pg_name(self, pg):
         return pg['DBParameterGroupName']
 
 
-class PGClusterMixin(object):
+class PGClusterMixin:
 
     def get_pg_name(self, pg):
         return pg['DBClusterParameterGroupName']
@@ -272,7 +268,8 @@ class Modify(BaseAction):
                     changed_params.append(param)
 
             # Can only do 20 elements at a time per docs, so if we have more than that we will
-            # break it into multiple requests: https://goo.gl/Z6oGNv
+            # break it into multiple requests:
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/rds.html#RDS.Client.modify_db_parameter_group
             for param_set in chunks(changed_params, 5):
                 self.do_modify(client, name, param_set)
 

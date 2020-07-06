@@ -20,7 +20,9 @@ from c7n.utils import type_schema, local_session
 
 @resources.register('service')
 class Service(QueryResourceManager):
-
+    """GCP Service Management
+    https://cloud.google.com/service-infrastructure/docs/service-management/reference/rest/v1/services
+    """
     class resource_type(TypeInfo):
         service = 'servicemanagement'
         version = 'v1'
@@ -29,6 +31,9 @@ class Service(QueryResourceManager):
         scope = 'project'
         scope_key = 'consumerId'
         scope_template = 'project:{}'
+        name = id = 'serviceName'
+        default_report_fields = [name, "producerProjectId"]
+        asset_type = 'serviceusage.googleapis.com/Service'
 
         @staticmethod
         def get(client, resource_info):
@@ -57,6 +62,7 @@ class Disable(MethodAction):
 
     schema = type_schema('disable')
     method_spec = {'op': 'disable'}
+    method_perm = 'update'
 
     def get_resource_params(self, model, resource):
         session = local_session(self.manager.session_factory)

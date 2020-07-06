@@ -39,10 +39,9 @@ CLI Usage
 
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from concurrent.futures import as_completed
 
+import csv
 from datetime import datetime
 import gzip
 import io
@@ -52,21 +51,19 @@ import logging
 import os
 from tabulate import tabulate
 
-import six
 from botocore.compat import OrderedDict
 from dateutil.parser import parse as date_parse
 
 from c7n.executor import ThreadPoolExecutor
 from c7n.utils import local_session, dumps
-from c7n.utils import UnicodeWriter
 
 log = logging.getLogger('custodian.reports')
 
 
 def report(policies, start_date, options, output_fh, raw_output_fh=None):
     """Format a policy's extant records into a report."""
-    regions = set([p.options.region for p in policies])
-    policy_names = set([p.name for p in policies])
+    regions = {p.options.region for p in policies}
+    policy_names = {p.name for p in policies}
     formatter = Formatter(
         policies[0].resource_manager.resource_type,
         extra_fields=options.field,
@@ -82,8 +79,8 @@ def report(policies, start_date, options, output_fh, raw_output_fh=None):
         if policy.ctx.output.type == 's3':
             policy_records = record_set(
                 policy.session_factory,
-                policy.ctx.output.bucket,
-                policy.ctx.output.key_prefix,
+                policy.ctx.output.config['netloc'],
+                policy.ctx.output.config['path'].strip('/'),
                 start_date)
         else:
             policy_records = fs_record_set(policy.ctx.log_dir, policy.name)
@@ -97,10 +94,13 @@ def report(policies, start_date, options, output_fh, raw_output_fh=None):
         records += policy_records
 
     rows = formatter.to_csv(records)
+
     if options.format == 'csv':
-        writer = UnicodeWriter(output_fh, formatter.headers())
+        writer = csv.writer(output_fh, formatter.headers())
         writer.writerow(formatter.headers())
         writer.writerows(rows)
+    elif options.format == 'json':
+        print(dumps(records, indent=2))
     else:
         # We special case CSV, and for other formats we pass to tabulate
         print(tabulate(rows, formatter.headers(), tablefmt=options.format))
@@ -136,13 +136,13 @@ def _get_values(record, field_list, tag_map):
             value = jmespath.search(field, record)
             if value is None:
                 value = ''
-            if not isinstance(value, six.text_type):
-                value = six.text_type(value)
+            if not isinstance(value, str):
+                value = str(value)
         vals.append(value)
     return vals
 
 
-class Formatter(object):
+class Formatter:
 
     def __init__(self, resource_type, extra_fields=(), include_default_fields=True,
                  include_region=False, include_policy=False, fields=()):
@@ -154,7 +154,7 @@ class Formatter(object):
 
         fields = OrderedDict(fields)
         mfields = getattr(model, 'default_report_fields', None)
-        if mfields is None:
+        if not mfields:
             mfields = [model.id]
             if model.name != model.id:
                 mfields.append(model.name)

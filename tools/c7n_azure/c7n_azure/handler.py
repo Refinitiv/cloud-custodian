@@ -20,16 +20,18 @@ import uuid
 from azure.common import AzureHttpError
 from msrestazure.azure_exceptions import CloudError
 
+from c7n.utils import reset_session_cache
 from c7n.config import Config
 from c7n.policy import PolicyCollection
 from c7n.resources import load_resources
+from c7n.structure import StructureParser
 
 from c7n_azure.provider import Azure
 
 log = logging.getLogger('custodian.azure.functions')
 
 
-def run(event, context):
+def run(event, context, subscription_id=None):
     # policies file should always be valid in functions so do loading naively
     with open(context['config_file']) as f:
         policy_config = json.load(f)
@@ -41,7 +43,6 @@ def run(event, context):
     options_overrides = \
         policy_config['policies'][0].get('mode', {}).get('execution-options', {})
 
-    # setup our auth file location on disk
     options_overrides['authorization_file'] = context['auth_file']
 
     # if output_dir specified use that, otherwise make a temp directory
@@ -51,17 +52,22 @@ def run(event, context):
     # merge all our options in
     options = Config.empty(**options_overrides)
 
-    load_resources()
+    if subscription_id is not None:
+        options['account_id'] = subscription_id
+
+    load_resources(StructureParser().get_resource_types(policy_config))
 
     options = Azure().initialize(options)
-
     policies = PolicyCollection.from_data(policy_config, options)
+
     if policies:
         for p in policies:
             try:
                 p.push(event, context)
             except (CloudError, AzureHttpError) as error:
                 log.error("Unable to process policy: %s :: %s" % (p.name, error))
+
+    reset_session_cache()
     return True
 
 

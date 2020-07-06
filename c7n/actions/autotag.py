@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import six
 
 from .core import EventAction
 from c7n.exceptions import PolicyValidationError
@@ -53,9 +52,10 @@ class AutoTagUser(EventAction):
     attempting to tag it.
 
     References
-     - AWS Config (see REQUIRED_TAGS caveat) - http://goo.gl/oDUXPY
-     - CloudTrail User - http://goo.gl/XQhIG6
-    """
+
+     CloudTrail User
+     https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-user-identity.html
+    """ # NOQA
 
     schema_alias = True
     schema = utils.type_schema(
@@ -86,6 +86,9 @@ class AutoTagUser(EventAction):
         if self.manager.action_registry.get('tag') is None:
             raise PolicyValidationError(
                 "Resource does not support tagging %s" % (self.manager.data,))
+        if 'tag' not in self.data:
+            raise PolicyValidationError(
+                "auto-tag action requires 'tag'")
         return self
 
     def process(self, resources, event):
@@ -93,14 +96,14 @@ class AutoTagUser(EventAction):
             return
         event = event['detail']
         utype = event['userIdentity']['type']
-        if utype not in self.data.get('user-type', ['AssumedRole', 'IAMUser']):
+        if utype not in self.data.get('user-type', ['AssumedRole', 'IAMUser', 'FederatedUser']):
             return
 
         user = None
         if utype == "IAMUser":
             user = event['userIdentity']['userName']
             principal_id_value = event['userIdentity'].get('principalId', '')
-        elif utype == "AssumedRole":
+        elif utype == "AssumedRole" or utype == "FederatedUser":
             user = event['userIdentity']['arn']
             prefix, user = user.rsplit('/', 1)
             principal_id_value = event['userIdentity'].get('principalId', '').split(':')[0]
@@ -138,16 +141,16 @@ class AutoTagUser(EventAction):
         principal_id_key = self.data.get('principal_id_tag', None)
         if principal_id_key and principal_id_value:
             new_tags[principal_id_key] = principal_id_value
-        for key, value in six.iteritems(new_tags):
+        for key, value in new_tags.items():
             tag_action({'key': key, 'value': value}, self.manager).process(untagged_resources)
         return new_tags
 
+    @classmethod
+    def register_resource(cls, registry, resource_class):
+        if 'auto-tag-user' in resource_class.action_registry:
+            return
+        if resource_class.action_registry.get('tag'):
+            resource_class.action_registry.register('auto-tag-user', AutoTagUser)
 
-def register_action_tag_user(registry, _):
-    for resource in registry.keys():
-        klass = registry.get(resource)
-        if klass.action_registry.get('tag') and not klass.action_registry.get('auto-tag-user'):
-            klass.action_registry.register('auto-tag-user', AutoTagUser)
 
-
-resources.subscribe(resources.EVENT_FINAL, register_action_tag_user)
+resources.subscribe(AutoTagUser.register_resource)

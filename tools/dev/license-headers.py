@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Add License headers to all py files."""
-from __future__ import print_function
-
 import fnmatch
 import os
 import inspect
@@ -22,7 +20,7 @@ import sys
 import c7n
 
 header = """\
-# Copyright 2017-2018 Capital One Services, LLC
+# Copyright 2018-2019 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

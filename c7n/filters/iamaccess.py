@@ -27,17 +27,16 @@ are.
 
 References
 
-- IAM Policy Evaluation - http://goo.gl/sH5Dt5
-- IAM Policy Reference - http://goo.gl/U0a06y
+- IAM Policy Evaluation
+  https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
+
+- IAM Policy Reference
+  https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements.html
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import fnmatch
 import logging
 import json
-
-import six
 
 from c7n.filters import Filter
 from c7n.resolver import ValuesFrom
@@ -54,7 +53,7 @@ def _account(arn):
     return arn.split(':', 5)[4]
 
 
-class PolicyChecker(object):
+class PolicyChecker:
     """
     checker_config:
       - check_actions: only check one of the specified actions
@@ -97,7 +96,7 @@ class PolicyChecker(object):
 
     # Policy statement handling
     def check(self, policy_text):
-        if isinstance(policy_text, six.string_types):
+        if isinstance(policy_text, str):
             policy = json.loads(policy_text)
         else:
             policy = policy_text
@@ -117,7 +116,7 @@ class PolicyChecker(object):
     def handle_action(self, s):
         if self.check_actions:
             actions = s.get('Action')
-            actions = isinstance(actions, six.string_types) and (actions,) or actions
+            actions = isinstance(actions, str) and (actions,) or actions
             for a in actions:
                 if fnmatch.filter(self.check_actions, a):
                     return True
@@ -141,7 +140,7 @@ class PolicyChecker(object):
 
         assert len(s['Principal']) == 1, "Too many principals %s" % s
 
-        if isinstance(s['Principal'], six.string_types):
+        if isinstance(s['Principal'], str):
             p = s['Principal']
         elif 'AWS' in s['Principal']:
             p = s['Principal']['AWS']
@@ -151,7 +150,7 @@ class PolicyChecker(object):
             return True
 
         principal_ok = True
-        p = isinstance(p, six.string_types) and (p,) or p
+        p = isinstance(p, str) and (p,) or p
         for pid in p:
             if pid == '*':
                 principal_ok = False
@@ -215,7 +214,7 @@ class PolicyChecker(object):
             cond['values'] = s['Condition'][s_cond_op][cond['key']]
             cond['values'] = (
                 isinstance(cond['values'],
-                           six.string_types) and (cond['values'],) or cond['values'])
+                           str) and (cond['values'],) or cond['values'])
             cond['key'] = cond['key'].lower()
             s_cond.append(cond)
 
@@ -250,7 +249,7 @@ class PolicyChecker(object):
 
     def handle_aws_principalorgid(self, s, c):
         if not self.allowed_orgid:
-            return False
+            return True
         return bool(set(map(_account, c['values'])).difference(self.allowed_orgid))
 
 
@@ -267,13 +266,13 @@ class CrossAccountAccessFilter(Filter):
         # disregard statements using these conditions.
         whitelist_conditions={'type': 'array', 'items': {'type': 'string'}},
         # white list accounts
-        whitelist_from=ValuesFrom.schema,
+        whitelist_from={'$ref': '#/definitions/filters_common/value_from'},
         whitelist={'type': 'array', 'items': {'type': 'string'}},
-        whitelist_orgids_from=ValuesFrom.schema,
+        whitelist_orgids_from={'$ref': '#/definitions/filters_common/value_from'},
         whitelist_orgids={'type': 'array', 'items': {'type': 'string'}},
-        whitelist_vpce_from=ValuesFrom.schema,
+        whitelist_vpce_from={'$ref': '#/definitions/filters_common/value_from'},
         whitelist_vpce={'type': 'array', 'items': {'type': 'string'}},
-        whitelist_vpc_from=ValuesFrom.schema,
+        whitelist_vpc_from={'$ref': '#/definitions/filters_common/value_from'},
         whitelist_vpc={'type': 'array', 'items': {'type': 'string'}})
 
     policy_attribute = 'Policy'

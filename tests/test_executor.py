@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from c7n import executor
 
 import unittest
 
 
-class Foo(object):
+class Foo:
 
     def __init__(self, state):
         self.state = state
@@ -38,17 +36,13 @@ class Foo(object):
         return args, kw
 
 
-class ExecutorBase(object):
+class ExecutorBase:
 
     def test_map_instance(self):
         with self.executor_factory(max_workers=3) as w:
             self.assertEqual(
                 list(w.map(Foo("123"), [1, 2, 3])), [((1,), {}), ((2,), {}), ((3,), {})]
             )
-
-
-class ProcessExecutorTest(ExecutorBase, unittest.TestCase):
-    executor_factory = executor.ProcessPoolExecutor
 
 
 class ThreadExecutorTest(ExecutorBase, unittest.TestCase):

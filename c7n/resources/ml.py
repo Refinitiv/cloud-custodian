@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
 
 from c7n.actions import BaseAction
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 
 
 @resources.register('ml-model')
 class MLModel(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'machinelearning'
         enum_spec = ('describe_ml_models', 'Results', None)
         id = 'MLModelId'
@@ -32,7 +30,8 @@ class MLModel(QueryResourceManager):
         date = 'CreatedAt'
         # need to specify request-mode dimension as well
         # dimension = 'MLModelId'
-        dimension = None
+        arn_type = "mlmodel"
+        permissions_enum = ('machinelearning:DescribeMLModels',)
 
 
 @MLModel.action_registry.register('delete')

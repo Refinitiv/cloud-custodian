@@ -1,4 +1,4 @@
-# Copyright 2016-2017 Capital One Services, LLC
+# Copyright 2016-2019 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,57 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
-import functools
 import re
 
 from c7n.actions import BaseAction
 from c7n.filters import MetricsFilter, ShieldMetrics, Filter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, DescribeSource
+from c7n.query import ConfigSource, QueryResourceManager, DescribeSource, TypeInfo
 from c7n.tags import universal_augment
-from c7n.utils import generate_arn, local_session, type_schema, get_retry
+from c7n.utils import local_session, type_schema, get_retry
+from c7n.filters import ValueFilter
+from .aws import shape_validate
+from c7n.exceptions import PolicyValidationError
 
 from c7n.resources.shield import IsShieldProtected, SetShieldProtection
-
-
-@resources.register('distribution')
-class Distribution(QueryResourceManager):
-    class resource_type(object):
-        service = 'cloudfront'
-        type = 'distribution'
-        enum_spec = ('list_distributions', 'DistributionList.Items', None)
-        id = 'Id'
-        name = 'DomainName'
-        date = 'LastModifiedTime'
-        dimension = "DistributionId"
-        universal_taggable = True
-        filter_name = None
-        config_type = "AWS::CloudFront::Distribution"
-        # Denotes this resource type exists across regions
-        global_resource = True
-
-    def get_arn(self, r):
-        return r['ARN']
-
-    @property
-    def generate_arn(self):
-        """ Generates generic arn if ID is not already arn format.
-        """
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn,
-                self.get_model().service,
-                account_id=self.account_id,
-                resource_type=self.get_model().type,
-                separator='/')
-        return self._generate_arn
-
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeDistribution(self)
-        return super(Distribution, self).get_source(source_type)
+from c7n.resources.securityhub import PostFinding
 
 
 class DescribeDistribution(DescribeSource):
@@ -70,48 +33,56 @@ class DescribeDistribution(DescribeSource):
         return universal_augment(self.manager, resources)
 
 
-@resources.register('streaming-distribution')
-class StreamingDistribution(QueryResourceManager):
-    class resource_type(object):
+@resources.register('distribution')
+class Distribution(QueryResourceManager):
+
+    class resource_type(TypeInfo):
         service = 'cloudfront'
-        type = 'streaming-distribution'
-        enum_spec = ('list_streaming_distributions',
-                     'StreamingDistributionList.Items',
-                     None)
+        arn_type = 'distribution'
+        enum_spec = ('list_distributions', 'DistributionList.Items', None)
         id = 'Id'
+        arn = 'ARN'
         name = 'DomainName'
         date = 'LastModifiedTime'
         dimension = "DistributionId"
         universal_taggable = True
-        filter_name = None
-        config_type = "AWS::CloudFront::StreamingDistribution"
+        cfn_type = config_type = "AWS::CloudFront::Distribution"
+        # Denotes this resource type exists across regions
+        global_resource = True
 
-    def get_arn(self, r):
-        return r['ARN']
-
-    @property
-    def generate_arn(self):
-        """ Generates generic arn if ID is not already arn format.
-        """
-        if self._generate_arn is None:
-            self._generate_arn = functools.partial(
-                generate_arn,
-                self.get_model().service,
-                account_id=self.account_id,
-                resource_type=self.get_model().type,
-                separator='/')
-        return self._generate_arn
-
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeStreamingDistribution(self)
-        return super(StreamingDistribution, self).get_source(source_type)
+    source_mapping = {
+        'describe': DescribeDistribution,
+        'config': ConfigSource
+    }
 
 
 class DescribeStreamingDistribution(DescribeSource):
 
     def augment(self, resources):
         return universal_augment(self.manager, resources)
+
+
+@resources.register('streaming-distribution')
+class StreamingDistribution(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'cloudfront'
+        arn_type = 'streaming-distribution'
+        enum_spec = ('list_streaming_distributions',
+                     'StreamingDistributionList.Items',
+                     None)
+        id = 'Id'
+        arn = 'ARN'
+        name = 'DomainName'
+        date = 'LastModifiedTime'
+        dimension = "DistributionId"
+        universal_taggable = True
+        cfn_type = config_type = "AWS::CloudFront::StreamingDistribution"
+
+    source_mapping = {
+        'describe': DescribeStreamingDistribution,
+        'config': ConfigSource
+    }
 
 
 Distribution.filter_registry.register('shield-metrics', ShieldMetrics)
@@ -180,6 +151,92 @@ class IsWafEnabled(Filter):
         return results
 
 
+class BaseDistributionConfig(ValueFilter):
+    schema = type_schema('distribution-config', rinherit=ValueFilter.schema)
+    schema_alias = False
+    annotation_key = 'c7n:distribution-config'
+    annotate = False
+
+    def process(self, resources, event=None):
+
+        self.augment([r for r in resources if self.annotation_key not in r])
+        return super().process(resources, event)
+
+    def __call__(self, r):
+        return super(BaseDistributionConfig, self).__call__(r[self.annotation_key])
+
+
+@Distribution.filter_registry.register('distribution-config')
+class DistributionConfig(BaseDistributionConfig):
+    """Check for Cloudfront distribution config values
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: logging-enabled
+                resource: distribution
+                filters:
+                  - type: distribution-config
+                    key: Logging.Enabled
+                    value: False
+   """
+    permissions = ('cloudfront:GetDistributionConfig',)
+
+    def augment(self, resources):
+        client = local_session(self.manager.session_factory).client(
+            'cloudfront', region_name=self.manager.config.region)
+
+        for r in resources:
+            try:
+                r[self.annotation_key] = client.get_distribution_config(Id=r['Id']) \
+                    .get('DistributionConfig')
+            except (client.exceptions.NoSuchDistribution):
+                r[self.annotation_key] = {}
+            except Exception as e:
+                self.log.warning(
+                    "Exception trying to get Distribution Config: %s error: %s",
+                    r['ARN'], e)
+                raise e
+
+
+@StreamingDistribution.filter_registry.register('distribution-config')
+class StreamingDistributionConfig(BaseDistributionConfig):
+    """Check for Cloudfront streaming distribution config values
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: streaming-distribution-logging-enabled
+                resource: streaming-distribution
+                filters:
+                  - type: distribution-config
+                    key: Logging.Enabled
+                    value: true
+   """
+    permissions = ('cloudfront:GetStreamingDistributionConfig',)
+
+    def augment(self, resources):
+
+        client = local_session(self.manager.session_factory).client(
+            'cloudfront', region_name=self.manager.config.region)
+
+        for r in resources:
+            try:
+                r[self.annotation_key] = client.get_streaming_distribution_config(Id=r['Id']) \
+                    .get('StreamingDistributionConfig')
+            except (client.exceptions.NoSuchStreamingDistribution):
+                r[self.annotation_key] = {}
+            except Exception as e:
+                self.log.warning(
+                    "Exception trying to get Streaming Distribution Config: %s error: %s",
+                    r['ARN'], e)
+                raise e
+
+
 @Distribution.filter_registry.register('mismatch-s3-origin')
 class MismatchS3Origin(Filter):
     """Check for existence of S3 bucket referenced by Cloudfront,
@@ -197,14 +254,14 @@ class MismatchS3Origin(Filter):
                     check_custom_origins: true
    """
 
-    s3_prefix = re.compile('.*(?=\.s3(-.*)?\.amazonaws.com)')
-    s3_suffix = re.compile('^([^.]+\.)?s3(-.*)?\.amazonaws.com')
+    s3_prefix = re.compile(r'.*(?=\.s3(-.*)?\.amazonaws.com)')
+    s3_suffix = re.compile(r'^([^.]+\.)?s3(-.*)?\.amazonaws.com')
 
     schema = type_schema(
         'mismatch-s3-origin',
         check_custom_origins={'type': 'boolean'})
 
-    permissions = ('s3:ListBuckets',)
+    permissions = ('s3:ListAllMyBuckets',)
     retry = staticmethod(get_retry(('Throttling',)))
 
     def is_s3_domain(self, x):
@@ -250,6 +307,29 @@ class MismatchS3Origin(Filter):
                     results.append(r)
 
         return results
+
+
+@Distribution.action_registry.register('post-finding')
+class DistributionPostFinding(PostFinding):
+
+    resource_type = 'AwsCloudFrontDistribution'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        origins = r['DistributionConfig']['Origins']
+
+        payload.update(self.filter_empty({
+            'DomainName': r['DomainName'],
+            'WebACLId': r.get('WebACLId'),
+            'LastModifiedTime': r['LastModifiedTime'],
+            'Status': r['Status'],
+            'Logging': self.filter_empty(r['DistributionConfig'].get('Logging', {})),
+            'Origins': [
+                dict(Id=o['Id'], OriginPath=o['OriginPath'], DomainName=o['DomainName'])
+                for o in origins]
+        }))
+
+        return envelope
 
 
 @Distribution.action_registry.register('set-waf')
@@ -309,8 +389,8 @@ class DistributionDisableAction(BaseAction):
                   - type: disable
     """
     schema = type_schema('disable')
-    permissions = ("distribution:GetDistributionConfig",
-                   "distribution:UpdateDistribution",)
+    permissions = ("cloudfront:GetDistributionConfig",
+                   "cloudfront:UpdateDistribution",)
 
     def process(self, distributions):
         client = local_session(
@@ -356,8 +436,8 @@ class StreamingDistributionDisableAction(BaseAction):
     """
     schema = type_schema('disable')
 
-    permissions = ("streaming-distribution:GetStreamingDistributionConfig",
-                   "streaming-distribution:UpdateStreamingDistribution",)
+    permissions = ("cloudfront:GetStreamingDistributionConfig",
+                   "cloudfront:UpdateStreamingDistribution",)
 
     def process(self, distributions):
         client = local_session(
@@ -399,7 +479,7 @@ class DistributionSSLAction(BaseAction):
                     value: allow-all
                     op: contains
                 actions:
-                  - type: set-ssl
+                  - type: set-protocols
                     ViewerProtocolPolicy: https-only
     """
     schema = {
@@ -420,8 +500,8 @@ class DistributionSSLAction(BaseAction):
         }
     }
 
-    permissions = ("distribution:GetDistributionConfig",
-                   "distribution:UpdateDistribution",)
+    permissions = ("cloudfront:GetDistributionConfig",
+                   "cloudfront:UpdateDistribution",)
 
     def process(self, distributions):
         client = local_session(self.manager.session_factory).client(
@@ -467,3 +547,180 @@ class DistributionSSLAction(BaseAction):
                 "Exception trying to force ssl on Distribution: %s error: %s",
                 distribution['ARN'], e)
             return
+
+
+class BaseUpdateAction(BaseAction):
+    schema = type_schema('set-attributes',
+                        attributes={"type": "object"},
+                        required=('attributes',))
+    schema_alias = False
+
+    def validate(self, config_name, shape):
+        attrs = dict(self.data.get('attributes'))
+        if attrs.get('CallerReference'):
+            raise PolicyValidationError('CallerReference field cannot be updated')
+
+        # Set default values for required fields if they are not present
+        attrs["CallerReference"] = ""
+        config = self.validation_config
+        updatedConfig = {**config, **attrs}
+
+        request = {
+            config_name: updatedConfig,
+            "Id": "sample_id",
+            "IfMatch": "sample_string",
+        }
+        return shape_validate(request, shape, 'cloudfront')
+
+    def process(self, distributions):
+        client = local_session(self.manager.session_factory).client(
+            self.manager.get_model().service)
+        for d in distributions:
+            self.process_distribution(client, d)
+
+
+@Distribution.action_registry.register('set-attributes')
+class DistributionUpdateAction(BaseUpdateAction):
+    """Action to update the attributes of a distribution
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+        - name: enforce-distribution-logging
+          resource: distribution
+          filters:
+            - type: value
+              key: "Logging.Enabled"
+              value: null
+          actions:
+            - type: set-attributes
+              attributes:
+                Comment: ""
+                Enabled: true
+                Logging:
+                    Enabled: true
+                    IncludeCookies: false
+                    Bucket: 'test-enable-logging-c7n.s3.amazonaws.com'
+                    Prefix: ''
+    """
+    permissions = ("cloudfront:UpdateDistribution",
+                   "cloudfront:GetDistributionConfig",)
+    shape = 'UpdateDistributionRequest'
+    validation_config = {
+        'Origins': {
+            'Quantity': 0,
+            'Items': [{
+                'Id': '',
+                'DomainName': ''
+            }]
+        },
+        'DefaultCacheBehavior': {
+            'TargetOriginId': '',
+            'ForwardedValues': {
+                'QueryString': True,
+                'Cookies': {
+                    'Forward': ''
+                }
+            },
+            'TrustedSigners': {
+                'Enabled': True,
+                'Quantity': 0
+            },
+            'ViewerProtocolPolicy': '',
+            'MinTTL': 0
+        },
+        'Comment': '',
+        'Enabled': False
+    }
+
+    def validate(self):
+        return super().validate('DistributionConfig', self.shape)
+
+    def process_distribution(self, client, distribution):
+        try:
+            res = client.get_distribution_config(
+                Id=distribution[self.manager.get_model().id])
+            default_config = self.validation_config
+            config = {**default_config, **res['DistributionConfig']}
+            updatedConfig = {**config, **self.data['attributes']}
+            if config == updatedConfig:
+                return
+            res = client.update_distribution(
+                Id=distribution[self.manager.get_model().id],
+                IfMatch=res['ETag'],
+                DistributionConfig=updatedConfig
+            )
+        except (client.exceptions.NoSuchDistribution):
+            pass
+        except Exception as e:
+            self.log.warning(
+                "Exception trying to update Distribution: %s error: %s",
+                distribution['ARN'], e)
+            raise e
+
+
+@StreamingDistribution.action_registry.register('set-attributes')
+class StreamingDistributionUpdateAction(BaseUpdateAction):
+    """Action to update the attributes of a distribution
+
+    :example:
+
+    .. code-block:: yaml
+
+        policies:
+        - name: enforce-streaming-distribution-logging
+          resource: streaming-distribution
+          filters:
+            - type: value
+              key: "Logging.Enabled"
+              value: false
+          actions:
+            - type: set-attributes
+              attributes:
+                Logging:
+                    Enabled: true
+                    Bucket: 'test-enable-logging-c7n.s3.amazonaws.com'
+                    Prefix: ''
+    """
+    permissions = ("cloudfront:UpdateStreamingDistribution",
+                   "cloudfront:GetStreamingDistributionConfig",)
+    shape = 'UpdateStreamingDistributionRequest'
+    validation_config = {
+        'S3Origin': {
+            'DomainName': 'domain_name',
+            'OriginAccessIdentity': 'origin_access_identity'
+        },
+        'TrustedSigners': {
+            'Enabled': False,
+            'Quantity': 0
+        },
+        'Comment': '',
+        'Enabled': False
+    }
+
+    def validate(self):
+        return super().validate('StreamingDistributionConfig', self.shape)
+
+    def process_distribution(self, client, streaming_distribution):
+        try:
+            res = client.get_streaming_distribution_config(
+                Id=streaming_distribution[self.manager.get_model().id])
+            default_config = self.validation_config
+            config = {**default_config, **res['StreamingDistributionConfig']}
+            updatedConfig = {**config, **self.data['attributes']}
+            if config == updatedConfig:
+                return
+            res = client.update_streaming_distribution(
+                Id=streaming_distribution[self.manager.get_model().id],
+                IfMatch=res['ETag'],
+                StreamingDistributionConfig=updatedConfig
+            )
+        except (client.exceptions.NoSuchStreamingDistribution):
+            pass
+        except Exception as e:
+            self.log.warning(
+                "Exception trying to update Streaming Distribution: %s error: %s",
+                streaming_distribution['ARN'], e)
+            raise e

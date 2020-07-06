@@ -22,8 +22,6 @@ std logging does default lock acquisition around handler emit).
 also uses a single thread for all outbound. Background thread
 uses a separate session.
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from c7n.exceptions import ClientError
 
 import itertools
@@ -45,7 +43,7 @@ SHUTDOWN_MARKER = object()
 EMPTY = Queue.Empty
 
 
-class Error(object):
+class Error:
 
     AlreadyAccepted = "DataAlreadyAcceptedException"
     InvalidToken = "InvalidSequenceTokenException"
@@ -59,7 +57,7 @@ class Error(object):
 class CloudWatchLogHandler(logging.Handler):
     """Python Log Handler to Send to Cloud Watch Logs
 
-    http://goo.gl/eZGAEK
+    https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/WhatIsCloudWatchLogs.html
     """
 
     batch_size = 20
@@ -82,7 +80,7 @@ class CloudWatchLogHandler(logging.Handler):
         # Logging module internally is tracking all handlers, for final
         # cleanup atexit, custodian is a bit more explicitly scoping shutdown to
         # each policy, so use a sentinel value to avoid deadlocks.
-        self.shutdown = False
+        self.shutdown = True
         retry = get_retry(('ThrottlingException',))
         try:
             client = self.session_factory().client('logs')
@@ -113,6 +111,7 @@ class CloudWatchLogHandler(logging.Handler):
 
         msg = self.format_message(message)
         if not self.transport:
+            self.shutdown = False
             self.start_transports()
         self.buf.append(msg)
         self.flush_buffers(
@@ -164,7 +163,7 @@ class CloudWatchLogHandler(logging.Handler):
         self.buf = []
 
 
-class Transport(object):
+class Transport:
 
     def __init__(self, queue, batch_size, batch_interval, session_factory):
         self.queue = queue

@@ -11,33 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
+import jmespath
 
 from c7n.actions import BaseAction
-from c7n.filters.vpc import SubnetFilter, SecurityGroupFilter
+from c7n.filters.vpc import SubnetFilter, SecurityGroupFilter, VpcFilter
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
-from c7n.utils import local_session, get_retry, type_schema
+from c7n.query import QueryResourceManager, DescribeSource, ConfigSource, TypeInfo
+from c7n.tags import universal_augment
+from c7n.utils import local_session, type_schema
+
+from .securityhub import OtherResourcePostFinding
 
 
 @resources.register('codecommit')
 class CodeRepository(QueryResourceManager):
 
-    retry = staticmethod(get_retry(('Throttling',)))
-
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'codecommit'
         enum_spec = ('list_repositories', 'repositories', None)
         batch_detail_spec = (
             'batch_get_repositories', 'repositoryNames', 'repositoryName',
             'repositories', None)
-        id = 'repositoryId'
-        name = 'repositoryName'
+        name = id = 'repositoryName'
+        arn = "Arn"
         date = 'creationDate'
-        dimension = None
-        filter_name = None
+        cfn_type = 'AWS::CodeCommit::Repository'
+        universal_taggable = object()
+
+    def get_resources(self, ids, cache=True):
+        return universal_augment(self, self.augment([{'repositoryName': i} for i in ids]))
 
 
 @CodeRepository.action_registry.register('delete')
@@ -74,29 +77,89 @@ class DeleteRepository(BaseAction):
                 "Exception deleting repo:\n %s" % e)
 
 
+class DescribeBuild(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(
+            self.manager,
+            super(DescribeBuild, self).augment(resources))
+
+
 @resources.register('codebuild')
 class CodeBuildProject(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'codebuild'
         enum_spec = ('list_projects', 'projects', None)
         batch_detail_spec = (
             'batch_get_projects', 'names', None, 'projects', None)
         name = id = 'name'
+        arn = 'arn'
         date = 'created'
-        dimension = None
-        filter_name = None
-        config_type = "AWS::CodeBuild::Project"
+        dimension = 'ProjectName'
+        cfn_type = config_type = "AWS::CodeBuild::Project"
+        arn_type = 'project'
+        universal_taggable = object()
+
+    source_mapping = {
+        'describe': DescribeBuild,
+        'config': ConfigSource
+    }
 
 
+@CodeBuildProject.filter_registry.register('subnet')
 class BuildSubnetFilter(SubnetFilter):
 
     RelatedIdsExpression = "vpcConfig.subnets[]"
 
 
+@CodeBuildProject.filter_registry.register('security-group')
 class BuildSecurityGroupFilter(SecurityGroupFilter):
 
     RelatedIdsExpression = "vpcConfig.securityGroupIds[]"
+
+
+@CodeBuildProject.filter_registry.register('vpc')
+class BuildVpcFilter(VpcFilter):
+
+    RelatedIdsExpression = "vpcConfig.vpcId"
+
+
+@CodeBuildProject.action_registry.register('post-finding')
+class BuildPostFinding(OtherResourcePostFinding):
+
+    resource_type = 'AwsCodeBuildProject'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(self.filter_empty({
+            'Name': r['name'],
+            'EncryptionKey': r['encryptionKey'],
+            'Environment': self.filter_empty({
+                'Type': r['environment']['type'],
+                'Certificate': r['environment'].get('certificate'),
+                'RegistryCredential': self.filter_empty({
+                    'Credential': jmespath.search(
+                        'environment.registryCredential.credential', r),
+                    'CredentialProvider': jmespath.search(
+                        'environment.registryCredential.credentialProvider', r)
+                }),
+                'ImagePullCredentialsType': r['environment'].get(
+                    'imagePullCredentialsType')
+            }),
+            'ServiceRole': r['serviceRole'],
+            'VpcConfig': self.filter_empty({
+                'VpcId': jmespath.search('vpcConfig.vpcId', r),
+                'Subnets': jmespath.search('vpcConfig.subnets', r),
+                'SecurityGroupIds': jmespath.search('vpcConfig.securityGroupIds', r)
+            }),
+            'Source': self.filter_empty({
+                'Type': jmespath.search('source.type', r),
+                'Location': jmespath.search('source.location', r),
+                'GitCloneDepth': jmespath.search('source.gitCloneDepth', r)
+            }),
+        }))
+        return envelope
 
 
 @CodeBuildProject.action_registry.register('delete')
@@ -133,16 +196,43 @@ class DeleteProject(BaseAction):
                 "Exception deleting project:\n %s" % e)
 
 
+class DescribePipeline(DescribeSource):
+
+    def augment(self, resources):
+        resources = super().augment(resources)
+        return universal_augment(self.manager, resources)
+
+
 @resources.register('codepipeline')
 class CodeDeployPipeline(QueryResourceManager):
 
-    retry = staticmethod(get_retry(('Throttling',)))
-
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'codepipeline'
         enum_spec = ('list_pipelines', 'pipelines', None)
         detail_spec = ('get_pipeline', 'name', 'name', 'pipeline')
-        dimension = filter_name = None
         name = id = 'name'
         date = 'created'
-        filter_name = None
+        # Note this is purposeful, codepipeline don't have a separate type specifier.
+        arn_type = ""
+        cfn_type = config_type = "AWS::CodePipeline::Pipeline"
+        universal_taggable = object()
+
+    source_mapping = {
+        'describe': DescribePipeline,
+        'config': ConfigSource
+    }
+
+
+@CodeDeployPipeline.action_registry.register('delete')
+class DeletePipeline(BaseAction):
+
+    schema = type_schema('delete')
+    permissions = ('codepipeline:DeletePipeline',)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('codepipeline')
+        for r in resources:
+            try:
+                self.manager.retry(client.delete_pipeline, name=r['name'])
+            except client.exceptions.PipelineNotFoundException:
+                continue

@@ -1,4 +1,4 @@
-# Copyright 2017-2018 Capital One Services, LLC
+# Copyright 2017-2019 Capital One Services, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import logging
-import six
 
 from c7n.actions import ActionRegistry
+from c7n.exceptions import PolicyValidationError
 from c7n.filters import FilterRegistry
 from c7n.manager import ResourceManager
 from c7n.query import sources
@@ -24,7 +24,7 @@ from c7n.utils import local_session
 log = logging.getLogger('custodian.k8s.query')
 
 
-class ResourceQuery(object):
+class ResourceQuery:
     def __init__(self, session_factory):
         self.session_factory = session_factory
 
@@ -39,14 +39,16 @@ class ResourceQuery(object):
         return self._invoke_client_enum(client, enum_op, params, path)
 
     def _invoke_client_enum(self, client, enum_op, params, path):
-        res = getattr(client, enum_op)(**params).to_dict()
+        res = getattr(client, enum_op)(**params)
+        if not isinstance(res, dict):
+            res = res.to_dict()
         if path and path in res:
             res = res.get(path)
         return res
 
 
 @sources.register('describe-kube')
-class DescribeSource(object):
+class DescribeSource:
     def __init__(self, manager):
         self.manager = manager
         self.query = ResourceQuery(manager.session_factory)
@@ -76,8 +78,7 @@ class QueryMeta(type):
         return super(QueryMeta, cls).__new__(cls, name, parents, attrs)
 
 
-@six.add_metaclass(QueryMeta)
-class QueryResourceManager(ResourceManager):
+class QueryResourceManager(ResourceManager, metaclass=QueryMeta):
     def __init__(self, data, options):
         super(QueryResourceManager, self).__init__(data, options)
         self.source = self.get_source(self.source_type)
@@ -119,6 +120,28 @@ class QueryResourceManager(ResourceManager):
         return resources
 
 
+class CustomResourceQueryManager(QueryResourceManager, metaclass=QueryMeta):
+    def get_resource_query(self):
+        custom_resource = self.data['query'][0]
+        return {
+            'version': custom_resource['version'],
+            'group': custom_resource['group'],
+            'plural': custom_resource['plural']
+        }
+
+    def validate(self):
+        required_keys = {'group', 'version', 'plural'}
+        if 'query' not in self.data:
+            raise PolicyValidationError(
+                "Custom resources require query in policy with only " +
+                "group, version, and plural attributes")
+        if set(list(self.data.get('query', [])[0].keys())) != required_keys:
+            raise PolicyValidationError(
+                "Custom resources require query in policy with only " +
+                "group, version, and plural attributes")
+        return self
+
+
 class TypeMeta(type):
     def __repr__(cls):
         return "<TypeInfo group:%s version:%s>" % (
@@ -126,8 +149,14 @@ class TypeMeta(type):
             cls.version)
 
 
-@six.add_metaclass(TypeMeta)
-class TypeInfo(object):
+class TypeInfo(metaclass=TypeMeta):
     group = None
     version = None
     enum_spec = ()
+    namespaced = True
+
+
+class CustomTypeInfo(TypeInfo, metaclass=TypeMeta):
+    group = 'CustomObjects'
+    version = ''
+    enum_spec = ('list_cluster_custom_object', 'items', None)

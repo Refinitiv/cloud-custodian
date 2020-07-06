@@ -30,6 +30,14 @@ class Function(QueryResourceManager):
         scope = 'project'
         scope_key = 'parent'
         scope_template = "projects/{}/locations/-"
+        name = id = "name"
+        default_report_fields = [
+            'name', 'runtime', 'eventTrigger.eventType', 'status', 'updateTime']
+
+        events = {
+            'create': 'google.cloud.functions.v1.CloudFunctionsService.CreateFunction',
+            'delete': 'google.cloud.functions.v1.CloudFunctionsService.DeleteFunction',
+            'update': 'google.cloud.functions.v1.CloudFunctionsService.UpdateFunction'}
 
         @staticmethod
         def get(client, resource_info):

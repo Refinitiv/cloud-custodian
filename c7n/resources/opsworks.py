@@ -11,43 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 from botocore.exceptions import ClientError
 
 from c7n.actions import BaseAction
 from c7n.manager import resources
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 from c7n import utils
-
-
-class StateTransitionFilter(object):
-    """Filter instances by state.
-
-    Try to simplify construction for policy authors by automatically
-    filtering elements (filters or actions) to the instances states
-    they are valid for. Separate from ec2 class as uses ['status']
-    instead of ['State']['Name'].
-
-    For more details see http://goo.gl/TZH9Q5
-    """
-    valid_origin_states = ()
-
-    def filter_instance_state(self, instances, states=None):
-        states = states or self.valid_origin_states
-        orig_length = len(instances)
-        results = [i for i in instances
-                   if i['Status'] in states]
-        self.log.info("%s %d of %d instances" % (
-            self.__class__.__name__, len(results), orig_length))
-        return results
 
 
 @resources.register('opswork-stack')
 class OpsworkStack(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = 'opsworks'
         enum_spec = ('describe_stacks', 'Stacks', None)
         filter_name = 'StackIds'
@@ -56,10 +32,12 @@ class OpsworkStack(QueryResourceManager):
         name = 'Name'
         date = 'CreatedAt'
         dimension = "StackId"
+        arn = "Arn"
+        cfn_type = 'AWS::OpsWorks::App'
 
 
 @OpsworkStack.action_registry.register('delete')
-class DeleteStack(BaseAction, StateTransitionFilter):
+class DeleteStack(BaseAction):
     """Action to delete Opswork Stack
 
     It is recommended to use a filter to avoid unwanted deletion of stacks
@@ -96,7 +74,7 @@ class DeleteStack(BaseAction, StateTransitionFilter):
                 client.delete_app(AppId=app['AppId'])
             instances = client.describe_instances(StackId=stack_id)['Instances']
             orig_length = len(instances)
-            instances = self.filter_instance_state(instances)
+            instances = self.filter_resources(instances, 'Status', self.valid_origin_states)
             if(len(instances) != orig_length):
                 self.log.exception(
                     "All instances must be stopped before deletion. Stack Id: %s Name: %s." %
@@ -159,14 +137,16 @@ class StopStack(BaseAction):
 @resources.register('opswork-cm')
 class OpsworksCM(QueryResourceManager):
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         service = "opsworkscm"
         enum_spec = ('describe_servers', 'Servers', None)
+        permission_prefix = 'opsworks-cm'
         filter_name = 'ServerName'
         filter_type = 'scalar'
         name = id = 'ServerName'
         date = 'CreatedAt'
-        dimension = None
+        arn = "ServerArn"
+        cfn_type = 'AWS::OpsWorksCM::Server'
 
 
 @OpsworksCM.action_registry.register('delete')

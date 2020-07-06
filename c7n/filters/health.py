@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import itertools
 
 from c7n.utils import local_session, chunks, type_schema
@@ -21,15 +19,20 @@ from c7n.manager import resources
 
 
 class HealthEventFilter(Filter):
-    """Check if there are health events related to the resources
+    """Check if there are operations health events (phd) related to the resources
 
-
+    https://aws.amazon.com/premiumsupport/technology/personal-health-dashboard/
 
     Health events are stored as annotation on a resource.
+
+    Custodian also supports responding to phd events via a lambda execution mode.
     """
+    schema_alias = True
     schema = type_schema(
         'health-event',
         types={'type': 'array', 'items': {'type': 'string'}},
+        category={'type': 'array', 'items': {
+            'enum': ['issue', 'accountNotification', 'scheduledChange']}},
         statuses={'type': 'array', 'items': {
             'type': 'string',
             'enum': ['open', 'upcoming', 'closed']
@@ -38,9 +41,6 @@ class HealthEventFilter(Filter):
                    'health:DescribeEventDetails')
 
     def process(self, resources, event=None):
-        if not resources:
-            return resources
-
         client = local_session(self.manager.session_factory).client(
             'health', region_name='us-east-1')
         f = self.get_filter_parameters()
@@ -116,4 +116,4 @@ class HealthEventFilter(Filter):
             resource_class.filter_registry.register('health-event', klass)
 
 
-resources.subscribe(resources.EVENT_REGISTER, HealthEventFilter.register_resources)
+resources.subscribe(HealthEventFilter.register_resources)

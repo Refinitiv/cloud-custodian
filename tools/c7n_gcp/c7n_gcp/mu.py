@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import base64
 from collections import namedtuple
 import json
 import logging
 import hashlib
 
 from c7n_gcp.client import errors
-from c7n.mu import custodian_archive as base_archive
+from c7n.mu import generate_requirements, get_exec_options, custodian_archive as base_archive
 from c7n.utils import local_session
 
 from googleapiclient.errors import HttpError
@@ -27,7 +26,14 @@ from googleapiclient.errors import HttpError
 log = logging.getLogger('c7n_gcp.mu')
 
 
-def custodian_archive(packages=None):
+OUTPUT_PACKAGE_MAP = {
+    'metrics.gcp': 'google-cloud-monitoring',
+    'log.gcp': 'google-cloud-logging',
+    'blob.gs': 'google-cloud-storage',
+}
+
+
+def custodian_archive(packages=None, deps=()):
     if not packages:
         packages = []
     packages.append('c7n_gcp')
@@ -37,24 +43,26 @@ def custodian_archive(packages=None):
     # but for pure python packages, if we have a local install and its
     # relatively small, it might be faster to just upload.
     #
+    # note we pin requirements to the same versions installed locally.
     requirements = set()
-    requirements.add('jmespath')
-    requirements.add('retrying')
-    requirements.add('python-dateutil')
-    requirements.add('ratelimiter>=1.2.0.post0')
-    requirements.add('google-auth>=1.4.1')
-    requirements.add('google-auth-httplib2>=0.0.3')
-    requirements.add('google-api-python-client>=1.7.3')
-
+    requirements.update((
+        'jmespath',
+        'retrying',
+        'python-dateutil',
+        'ratelimiter',
+        'google-auth',
+        'google-auth-httplib2',
+        'google-api-python-client'))
+    requirements.update(deps)
     archive.add_contents(
         'requirements.txt',
-        '\n'.join(sorted(requirements)))
+        generate_requirements(requirements, include_self=True))
     return archive
 
 
-class CloudFunctionManager(object):
+class CloudFunctionManager:
 
-    def __init__(self, session_factory, region="us-central1"):
+    def __init__(self, session_factory, region):
         self.session_factory = session_factory
         self.session = local_session(session_factory)
         self.client = self.session.client(
@@ -201,7 +209,7 @@ def delta_resource(old_config, new_config, ignore=()):
     return found
 
 
-class CloudFunction(object):
+class CloudFunction:
 
     def __init__(self, func_data, archive=None):
         self.func_data = func_data
@@ -218,6 +226,10 @@ class CloudFunction(object):
     @property
     def memory_size(self):
         return self.func_data.get('memory-size', 512)
+
+    @property
+    def service_account(self):
+        return self.func_data.get('service-account', None)
 
     @property
     def runtime(self):
@@ -266,6 +278,9 @@ class CloudFunction(object):
         if self.max_instances:
             conf['maxInstances'] = self.max_instances
 
+        if self.service_account:
+            conf['serviceAccountEmail'] = self.service_account
+
         for e in self.events:
             conf.update(e.get_config(self))
         return conf
@@ -283,12 +298,20 @@ import sys
 
 def run(event, context=None):
     logging.info("starting function execution")
-    event = json.loads(base64.b64decode(event['data']).decode('utf-8'))
+
+    trigger_type = os.environ.get('FUNCTION_TRIGGER_TYPE', '')
+    if trigger_type == 'HTTP_TRIGGER':
+        event = {'request': event}
+    else:
+        event = json.loads(base64.b64decode(event['data']).decode('utf-8'))
     print("Event: %s" % (event,))
+
     try:
         from c7n_gcp.handler import run
         result = run(event, context)
         logging.info("function execution complete")
+        if trigger_type == 'HTTP_TRIGGER':
+            return json.dumps(result), 200, (('Content-Type', 'application/json'),)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -301,8 +324,26 @@ class PolicyFunction(CloudFunction):
     def __init__(self, policy, archive=None, events=()):
         self.policy = policy
         self.func_data = self.policy.data['mode']
-        self.archive = archive or custodian_archive()
+        self.archive = archive or custodian_archive(
+            deps=self.get_output_deps())
         self._events = events
+
+    def get_output_deps(self):
+        deps = []
+        self.policy.ctx.initialize()
+
+        outputs = (
+            ('metrics', self.policy.ctx.metrics),
+            ('blob', self.policy.ctx.output),
+            ('log', self.policy.ctx.logs)
+        )
+        for (output_type, instance) in outputs:
+            if not instance:
+                continue
+            if f"{output_type}.{instance.type}" not in OUTPUT_PACKAGE_MAP:
+                continue
+            deps.append(OUTPUT_PACKAGE_MAP[f"{output_type}.{instance.type}"])
+        return deps
 
     @property
     def name(self):
@@ -315,8 +356,10 @@ class PolicyFunction(CloudFunction):
     def get_archive(self):
         self.archive.add_contents('main.py', PolicyHandlerTemplate)
         self.archive.add_contents(
-            'config.json', json.dumps(
-                {'policies': [self.policy.data]}, indent=2))
+            'config.json', json.dumps({
+                'execution-options': get_exec_options(self.policy.options),
+                'policies': [self.policy.data]},
+                indent=2))
         self.archive.close()
         return self.archive
 
@@ -326,11 +369,15 @@ class PolicyFunction(CloudFunction):
         return config
 
 
-class EventSource(object):
+class EventSource:
 
     def __init__(self, session, data=None):
         self.data = data
         self.session = session
+
+    @property
+    def prefix(self):
+        return self.data.get('prefix', 'custodian-auto-')
 
     def add(self, func):
         """Default no-op
@@ -438,10 +485,124 @@ class PubSubSource(EventSource):
         self.ensure_topic()
 
     def remove(self):
-        if not self.data.get('topic').startswith('custodian-auto'):
+        if not self.data.get('topic').startswith(self.prefix):
             return
         client = self.session.client('topic', 'v1', 'projects.topics')
         client.execute_command('delete', {'topic': self.get_topic_param()})
+
+
+class PeriodicEvent(EventSource):
+    """Periodic serverless execution.
+
+    Supports both http and pub/sub triggers.
+
+    Note periodic requires the setup of app engine and is restricted
+    to app engine locations.
+    https://cloud.google.com/scheduler/docs/setup
+
+    Schedule can be specified in either cron syntax or app engine schedule expression.
+    https://cloud.google.com/scheduler/docs/configuring/cron-job-schedules
+
+    Examples of schedule expressions.
+    https://cloud.google.com/appengine/docs/standard/python/config/cronref
+    """
+
+    def __init__(self, session, data, region):
+        self.session = session
+        self.data = data
+        self.region = region
+
+    @property
+    def target_type(self):
+        return self.data.get('target-type', 'http')
+
+    def get_config(self, func):
+        return self.get_target(func).get_config(func)
+
+    def add(self, func):
+        target = self.get_target(func)
+        target.add(func)
+        job = self.get_job_config(func, target)
+
+        client = self.session.client(
+            'cloudscheduler', 'v1beta1', 'projects.locations.jobs')
+
+        delta = self.diff_job(client, job)
+        if delta:
+            log.info("update periodic function - %s" % (", ".join(delta)))
+            return client.execute_command(
+                'patch', {
+                    'name': job['name'],
+                    'updateMask': ','.join(delta),
+                    'body': job})
+        elif delta is not None:
+            return
+        return client.execute_command(
+            'create', {
+                'parent': 'projects/{}/locations/{}'.format(
+                    self.session.get_default_project(),
+                    self.region),
+                'body': job})
+
+    def remove(self, func):
+        target = self.get_target(func)
+        target.remove(func)
+        job = self.get_job_config(func, target)
+
+        if not job['name'].rsplit('/', 1)[-1].startswith(self.prefix):
+            return
+
+        client = self.session.client(
+            'cloudscheduler', 'v1beta1', 'projects.locations.jobs')
+
+        return client.execute_command('delete', {'name': job['name']})
+
+    # Periodic impl
+
+    def diff_job(self, client, target_job):
+        try:
+            job = client.execute_query('get', {'name': target_job['name']})
+        except HttpError as e:
+            if e.resp.status != 404:
+                raise
+            return None
+
+        delta = delta_resource(job, target_job, ignore=('httpTarget', 'pubSubTarget'))
+        if not delta:
+            return False
+        return delta
+
+    def get_target(self, func):
+        if self.target_type == 'http':
+            return HTTPEvent(self.session, self.data)
+        elif self.target_type == 'pubsub':
+            config = dict(self.data)
+            config['topic'] = '{}{}'.format(self.prefix, func.name)
+            return PubSubSource(self.session, config)
+        else:
+            raise ValueError("Unknown periodic target: %s" % self.target_type)
+
+    def get_job_config(self, func, target):
+        job = {
+            'name': "projects/{}/locations/{}/jobs/{}".format(
+                self.session.get_default_project(),
+                self.region,
+                self.data.get('name', '{}{}'.format(self.prefix, func.name))),
+            'schedule': self.data['schedule'],
+            'timeZone': self.data.get('tz', 'Etc/UTC')}
+
+        if self.target_type == 'http':
+            job['httpTarget'] = {
+                'uri': 'https://{}-{}.cloudfunctions.net/{}'.format(
+                    self.region,
+                    self.session.get_default_project(),
+                    func.name)
+            }
+        elif self.target_type == 'pubsub':
+            job['pubsubTarget'] = {
+                'topicName': target.get_topic_param(),
+            }
+        return job
 
 
 LogInfo = namedtuple('LogInfo', 'name scope_type scope_id id')
@@ -550,7 +711,7 @@ class LogSubscriber(EventSource):
 
     def remove(self, func):
         """Remove any provisioned log sink if auto created"""
-        if not self.data['name'].startswith('custodian-auto'):
+        if not self.data['name'].startswith(self.prefix):
             return
         parent = self.get_parent(self.get_log())
         _, sink_path, _ = self.get_sink()
@@ -589,8 +750,8 @@ class ApiSubscriber(EventSource):
         log_filter += " AND protoPayload.methodName = (%s)" % (
             ' OR '.join(['"%s"' % m for m in self.data['methods']]))
         return {
-            'topic': 'custodian-auto-audit-%s' % func.name,
-            'name': 'custodian-auto-audit-%s' % func.name,
+            'topic': '{}audit-{}'.format(self.prefix, func.name),
+            'name': '{}audit-{}'.format(self.prefix, func.name),
             'log': log_name,
             'filter': log_filter}
 
